@@ -10,6 +10,12 @@ class AuthService {
     );
   }
 
+  Future<void> signInWithGoogle() async {
+  await _supabase.auth.signInWithOAuth(
+    OAuthProvider.google,
+  );
+}
+
   Future<void> signOut() async {
     await _supabase.auth.signOut();
   }

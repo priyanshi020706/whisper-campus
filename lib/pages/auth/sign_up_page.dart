@@ -1,8 +1,9 @@
+
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-import '../../core/constants/app_constants.dart';
 import '../../services/auth_service.dart';
+
 class SignUpPage extends StatefulWidget {
   const SignUpPage({super.key});
 
@@ -11,64 +12,36 @@ class SignUpPage extends StatefulWidget {
 }
 
 class _SignUpPageState extends State<SignUpPage> {
-  final _emailController = TextEditingController();
   final _authService = AuthService();
 
   bool _loading = false;
   String _message = '';
 
-  Future<void> _sendMagicLink() async {
-    final email = _emailController.text.trim().toLowerCase();
-
-    if (!email.endsWith(AppConstants.collegeDomain)) {
-      setState(() {
-        _message = 'Please use your MITS college email.';
-      });
-      return;
-    }
-
+  Future<void> _signInWithGoogle() async {
     setState(() {
       _loading = true;
       _message = '';
     });
 
     try {
-    await _authService.sendMagicLink(email);
-
-      if (!mounted) return;
-
-      setState(() {
-        _message =
-            'Magic link sent!\n\n'
-            'Check your MITS email and click the sign-in link.';
-      });
+      await _authService.signInWithGoogle();
     } on AuthException catch (e) {
       if (!mounted) return;
 
       setState(() {
         _message = e.message;
+        _loading = false;
       });
     } catch (e) {
       if (!mounted) return;
 
-      debugPrint('AUTH ERROR: $e');
+      debugPrint('GOOGLE AUTH ERROR: $e');
 
       setState(() {
-        _message = 'Something went wrong. Please try again.';
+        _message = 'Google sign-in failed. Please try again.';
+        _loading = false;
       });
     }
-
-    if (!mounted) return;
-
-    setState(() {
-      _loading = false;
-    });
-  }
-
-  @override
-  void dispose() {
-    _emailController.dispose();
-    super.dispose();
   }
 
   @override
@@ -95,46 +68,27 @@ class _SignUpPageState extends State<SignUpPage> {
                   ),
                   textAlign: TextAlign.center,
                 ),
-
                 const SizedBox(height: 12),
-
                 const Text(
-                  'Use your MITS college email to continue.',
+                  'Sign in with your MITS Google account to continue.',
                   textAlign: TextAlign.center,
                 ),
-
                 const SizedBox(height: 32),
-
-                TextField(
-                  controller: _emailController,
-                  keyboardType: TextInputType.emailAddress,
-                  enabled: !_loading,
-                  decoration: const InputDecoration(
-                    labelText: 'College email',
-                    hintText: 'you@mitsgwl.ac.in',
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-
-                const SizedBox(height: 20),
-
                 SizedBox(
                   width: double.infinity,
-                  child: ElevatedButton(
-                    onPressed: _loading ? null : _sendMagicLink,
+                  child: OutlinedButton(
+                    onPressed: _loading ? null : _signInWithGoogle,
                     child: Padding(
                       padding: const EdgeInsets.all(14),
                       child: Text(
                         _loading
-                            ? 'Sending...'
-                            : 'Send Magic Link',
+                            ? 'Connecting to Google...'
+                            : 'Continue with Google',
                       ),
                     ),
                   ),
                 ),
-
                 const SizedBox(height: 20),
-
                 if (_message.isNotEmpty)
                   Text(
                     _message,
