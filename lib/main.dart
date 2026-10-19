@@ -1,10 +1,10 @@
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'core/theme/app_theme.dart';
+import 'core/theme/theme_controller.dart';
 import 'pages/auth/auth_gate.dart';
-
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,14 +16,14 @@ Future<void> main() async {
     // Web is currently our development target.
     // We use implicit flow for this client-only web app.
     // Mobile will use PKCE when we configure deep links.
-  authOptions: FlutterAuthClientOptions(
-    authFlowType: kIsWeb
-        ? AuthFlowType.implicit
-        : AuthFlowType.pkce,
-  ),
-);
+    authOptions: FlutterAuthClientOptions(
+      authFlowType: kIsWeb ? AuthFlowType.implicit : AuthFlowType.pkce,
+    ),
+  );
 
-  runApp(const MyApp());
+  final themeController = ThemeController();
+  await themeController.load();
+  runApp(MyApp(themeController: themeController));
 }
 
 final supabase = Supabase.instance.client;
@@ -33,23 +33,28 @@ final supabase = Supabase.instance.client;
 // ============================================================
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  const MyApp({super.key, this.themeController});
+
+  static final _fallbackThemeController = ThemeController();
+
+  final ThemeController? themeController;
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'Whisper Campus',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.deepPurple,
+    final controller = themeController ?? _fallbackThemeController;
+    return AppThemeScope(
+      controller: controller,
+      child: AnimatedBuilder(
+        animation: controller,
+        builder: (context, _) => MaterialApp(
+          debugShowCheckedModeBanner: false,
+          title: 'Whisper Campus',
+          theme: AppTheme.light,
+          darkTheme: AppTheme.dark,
+          themeMode: controller.themeMode,
+          home: const AuthGate(),
         ),
-        useMaterial3: true,
       ),
-      home: const AuthGate(),
     );
   }
 }
-
-
-
