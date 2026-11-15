@@ -5,6 +5,7 @@ import '../../core/widgets/campus_live_action.dart';
 import '../../models/profile_activity.dart';
 import '../../models/profile_model.dart';
 import '../../models/post_content.dart';
+import '../../models/campus_department.dart';
 import 'profile_post_detail_page.dart';
 
 const _avatarChoices = [
@@ -43,8 +44,11 @@ class _ProfilePageState extends State<ProfilePage> {
   bool _saving = false;
   String? _error;
   String? _realName;
+  String? _enrollmentNumber;
+  List<String> _moderatedRooms = [];
   ProfileStats _stats = const ProfileStats();
   List<ProfileActivity> _activity = [];
+  List<Map<String, dynamic>> _pendingPosts = [];
   _ProfileSection _section = _ProfileSection.posts;
 
   @override
@@ -74,15 +78,23 @@ class _ProfilePageState extends State<ProfilePage> {
       final data = await _supabase
           .from('profiles')
           .select(
-            'anon_username, avatar_seed, role, department, academic_year, bio',
+            'anon_username, avatar_seed, role, branch_code, department, academic_year, bio',
           )
           .eq('id', userId)
           .single();
       String? realName;
+      String? enrollmentNumber;
+      List<String> moderatedRooms = [];
       if (widget.officialMode) {
-        final identityRows = await _supabase.rpc('get_my_identity');
-        if (identityRows is List && identityRows.isNotEmpty) {
-          realName = identityRows.first['real_name'] as String?;
+        final officialRows = await _supabase.rpc(
+          'get_official_profile_card',
+          params: {'p_user_id': userId},
+        );
+        if (officialRows is List && officialRows.isNotEmpty) {
+          final officialProfile = Map<String, dynamic>.from(officialRows.first);
+          realName = officialProfile['real_name'] as String?;
+          enrollmentNumber = officialProfile['enrollment_number'] as String?;
+          moderatedRooms = List<String>.from(officialProfile['moderated_rooms'] ?? const []);
         }
       }
 
@@ -92,15 +104,22 @@ class _ProfilePageState extends State<ProfilePage> {
             : 'get_my_unofficial_profile_stats',
       );
       final activityRows = await _fetchActivityRows(_section);
+      final pendingRows = await _supabase.rpc(
+        'get_my_pending_room_posts',
+        params: {'p_mode': widget.officialMode ? 'official' : 'unofficial'},
+      );
 
       if (!mounted) return;
       setState(() {
         _profile = ProfileModel.fromMap(data);
         _realName = realName;
+        _enrollmentNumber = enrollmentNumber;
+        _moderatedRooms = moderatedRooms;
         _stats = ProfileStats.fromRow(
           Map<String, dynamic>.from((statsRows as List).first),
         );
         _activity = activityRows;
+        _pendingPosts = List<Map<String, dynamic>>.from(pendingRows);
         _error = null;
         _loading = false;
       });
@@ -257,6 +276,117 @@ class _ProfilePageState extends State<ProfilePage> {
     }
   }
 
+  Future<void> _editFacultyProfile() async {
+    final profile = _profile;
+    if (profile == null || _saving) return;
+    final words = (_realName ?? '').trim().split(RegExp(r'\s+'));
+    final firstName = TextEditingController(
+      text: words.isEmpty ? '' : words.first,
+    );
+    final lastName = TextEditingController(
+      text: words.length < 2 ? '' : words.skip(1).join(' '),
+    );
+    String? departmentCode = profile.branchCode?.toLowerCase();
+
+    final edits = await showDialog<Map<String, String?>>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Edit faculty profile'),
+          content: SizedBox(
+            width: 420,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: firstName,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: const InputDecoration(labelText: 'First name *'),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: lastName,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: const InputDecoration(labelText: 'Last name *'),
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String?>(
+                  value: departmentCode,
+                  decoration: const InputDecoration(
+                    labelText: 'Department (optional)',
+                  ),
+                  items: [
+                    const DropdownMenuItem<String?>(
+                      value: null,
+                      child: Text('No department selected'),
+                    ),
+                    ...campusDepartments.map(
+                      (department) => DropdownMenuItem<String?>(
+                        value: department.code,
+                        child: Text(
+                          '${department.name} (${department.code.toUpperCase()})',
+                        ),
+                      ),
+                    ),
+                  ],
+                  onChanged: (value) =>
+                      setDialogState(() => departmentCode = value),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, {
+                'first': firstName.text.trim(),
+                'last': lastName.text.trim(),
+                'department': departmentCode,
+              }),
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+    firstName.dispose();
+    lastName.dispose();
+    if (edits == null || !mounted) return;
+    if ((edits['first'] ?? '').isEmpty || (edits['last'] ?? '').isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter both your first and last name.')),
+      );
+      return;
+    }
+
+    setState(() => _saving = true);
+    try {
+      await _supabase.rpc(
+        'save_my_faculty_profile',
+        params: {
+          'p_first_name': edits['first'],
+          'p_last_name': edits['last'],
+          'p_department_code': edits['department'],
+        },
+      );
+      await _fetchProfile();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Faculty profile updated.')),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not save faculty profile: $error')),
+      );
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   Future<void> _signOut() async {
     try {
       await _supabase.auth.signOut();
@@ -351,6 +481,10 @@ class _ProfilePageState extends State<ProfilePage> {
                           const SizedBox(height: 16),
                           _buildStats(colors),
                           const SizedBox(height: 18),
+                          if (_pendingPosts.isNotEmpty) ...[
+                            _buildPendingPosts(colors),
+                            const SizedBox(height: 18),
+                          ],
                           _buildActivitySection(colors),
                         ],
                       ),
@@ -364,6 +498,7 @@ class _ProfilePageState extends State<ProfilePage> {
 
   Widget _buildIdentityHeader(ColorScheme colors) {
     final profile = _profile!;
+    final isFaculty = profile.role == 'faculty' || profile.role == 'super_admin';
     final hasBio = profile.bio?.trim().isNotEmpty == true;
     return Card(
       clipBehavior: Clip.antiAlias,
@@ -427,10 +562,16 @@ class _ProfilePageState extends State<ProfilePage> {
                             : _avatarFace(profile.avatarSeed, fontSize: 32),
                       ),
                       const Spacer(),
-                      if (!widget.officialMode)
+                      if (!widget.officialMode || (widget.officialMode && isFaculty))
                         IconButton.filledTonal(
-                          tooltip: 'Edit bio and avatar',
-                          onPressed: _saving ? null : _editProfile,
+                          tooltip: widget.officialMode
+                              ? 'Edit faculty profile'
+                              : 'Edit bio and avatar',
+                          onPressed: _saving
+                              ? null
+                              : widget.officialMode
+                              ? _editFacultyProfile
+                              : _editProfile,
                           icon: const Icon(Icons.edit_rounded),
                         ),
                     ],
@@ -443,7 +584,7 @@ class _ProfilePageState extends State<ProfilePage> {
                     children: [
                       Text(
                         widget.officialMode
-                            ? (_realName ?? 'Student')
+                            ? (_realName ?? (isFaculty ? 'Faculty' : 'Student'))
                             : profile.anonUsername,
                         style: Theme.of(context).textTheme.headlineSmall
                             ?.copyWith(
@@ -454,14 +595,18 @@ class _ProfilePageState extends State<ProfilePage> {
                       const SizedBox(height: 3),
                       Text(
                         widget.officialMode
-                            ? 'MITS student'
+                            ? isFaculty
+                                  ? (profile.role == 'super_admin'
+                                        ? 'Faculty · Super Admin'
+                                        : 'Faculty')
+                                  : 'MITS student'
                             : 'Anonymous student',
                         style: Theme.of(context).textTheme.bodyMedium
                             ?.copyWith(color: colors.onSurfaceVariant),
                       ),
                       if (widget.officialMode &&
                           (profile.department != null ||
-                              profile.academicYear != null)) ...[
+                              (!isFaculty && profile.academicYear != null))) ...[
                         const SizedBox(height: 11),
                         Wrap(
                           spacing: 8,
@@ -472,7 +617,7 @@ class _ProfilePageState extends State<ProfilePage> {
                                 label: profile.department!,
                                 icon: Icons.account_balance_outlined,
                               ),
-                            if (profile.academicYear != null)
+                            if (!isFaculty && profile.academicYear != null)
                               _ProfileTag(
                                 label: 'Year ${profile.academicYear}',
                                 icon: Icons.school_outlined,
@@ -480,18 +625,37 @@ class _ProfilePageState extends State<ProfilePage> {
                           ],
                         ),
                       ],
-                      const SizedBox(height: 12),
-                      Text(
-                        hasBio
-                            ? profile.bio!.trim()
-                            : 'Add a short bio to introduce yourself.',
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: hasBio
-                              ? colors.onSurface
-                              : colors.onSurfaceVariant,
-                          height: 1.4,
+                      if (widget.officialMode && _enrollmentNumber != null) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Enrollment number: $_enrollmentNumber',
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: colors.onSurfaceVariant,
+                          ),
                         ),
-                      ),
+                      ],
+                      if (widget.officialMode && _moderatedRooms.isNotEmpty) ...[
+                        const SizedBox(height: 8),
+                        Text('Room moderator in', style: Theme.of(context).textTheme.labelLarge),
+                        const SizedBox(height: 5),
+                        Wrap(spacing: 6, runSpacing: 4, children: [
+                          for (final room in _moderatedRooms)
+                            _ProfileTag(label: room, icon: Icons.shield_outlined),
+                        ]),
+                      ],
+                      const SizedBox(height: 12),
+                      if (!isFaculty)
+                        Text(
+                          hasBio
+                              ? profile.bio!.trim()
+                              : 'Add a short bio to introduce yourself.',
+                          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            color: hasBio
+                                ? colors.onSurface
+                                : colors.onSurfaceVariant,
+                            height: 1.4,
+                          ),
+                        ),
                       if (!widget.officialMode) ...[
                         const SizedBox(height: 12),
                         OutlinedButton.icon(
@@ -620,6 +784,25 @@ class _ProfilePageState extends State<ProfilePage> {
                 officialMode: widget.officialMode,
                 onTap: () => _openActivity(item),
               ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildPendingPosts(ColorScheme colors) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text('Post review status', style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800)),
+        const SizedBox(height: 8),
+        for (final post in _pendingPosts)
+          Card(
+            child: ListTile(
+              leading: Icon(post['approval_status'] == 'pending' ? Icons.hourglass_top_rounded : Icons.cancel_outlined,
+                  color: post['approval_status'] == 'pending' ? colors.tertiary : colors.error),
+              title: Text(post['approval_status'] == 'pending' ? 'Waiting for room moderator' : 'Not approved'),
+              subtitle: Text('${post['room_id']} · ${(post['content']?.toString() ?? '').replaceAll(RegExp(r'\s+'), ' ').trim()}', maxLines: 2, overflow: TextOverflow.ellipsis),
             ),
           ),
       ],

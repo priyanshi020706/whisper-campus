@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'faculty_moderator_page.dart';
+
 class RoomDiscoveryPage extends StatefulWidget {
   const RoomDiscoveryPage({super.key, this.selectedRoomId});
 
@@ -14,6 +16,8 @@ class _RoomDiscoveryPageState extends State<RoomDiscoveryPage> {
   final _supabase = Supabase.instance.client;
   List<_Room> _rooms = [];
   bool _loading = true;
+  bool _isFaculty = false;
+  bool _isSuperAdmin = false;
   String? _error;
 
   @override
@@ -28,6 +32,12 @@ class _RoomDiscoveryPageState extends State<RoomDiscoveryPage> {
       _error = null;
     });
     try {
+      final currentUserId = _supabase.auth.currentUser?.id;
+      final profile = currentUserId == null ? null : await _supabase
+          .from('profiles')
+          .select('role')
+          .eq('id', currentUserId)
+          .maybeSingle();
       final rows = await _supabase
           .from('rooms')
           .select('id, name')
@@ -43,7 +53,7 @@ class _RoomDiscoveryPageState extends State<RoomDiscoveryPage> {
       );
       final availableById = {
         for (final room in loadedRooms)
-          if (room.id != 'general' && !room.id.startsWith('dept-'))
+          if (room.id != 'general' && room.id != 'official-live' && !room.id.startsWith('dept-'))
             room.id: room,
         if (hasDepartmentRooms)
           'departments': const _Room(id: 'departments', name: 'Departments'),
@@ -68,6 +78,8 @@ class _RoomDiscoveryPageState extends State<RoomDiscoveryPage> {
       if (!mounted) return;
       setState(() {
         _rooms = rooms;
+        _isFaculty = profile?['role'] == 'faculty' || profile?['role'] == 'super_admin';
+        _isSuperAdmin = profile?['role'] == 'super_admin';
         _loading = false;
       });
     } catch (_) {
@@ -80,12 +92,38 @@ class _RoomDiscoveryPageState extends State<RoomDiscoveryPage> {
   }
 
   @override
+  Future<void> _createRoom() async {
+    final name = TextEditingController();
+    final accepted = await showDialog<bool>(context: context, builder: (dialogContext) => AlertDialog(
+      title: const Text('Create a room'),
+      content: TextField(controller: name, autofocus: true, decoration: const InputDecoration(labelText: 'Room name')),
+      actions: [TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Create'))],
+    ));
+    final roomName = name.text.trim();
+    name.dispose();
+    if (accepted != true || roomName.length < 2) return;
+    final id = roomName.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '-').replaceAll(RegExp(r'^-|-$'), '');
+    try {
+      await _supabase.rpc('create_room', params: {'p_room_id': id, 'p_name': roomName});
+      await _loadRooms();
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not create room: ' + error.toString())));
+    }
+  }
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Explore the rooms'),
         actions: [
+          if (_isSuperAdmin)
+            IconButton(tooltip: 'Create room', onPressed: _createRoom, icon: const Icon(Icons.add_circle_outline)),
+          if (_isFaculty)
+            IconButton(
+              tooltip: 'Manage room moderators',
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const FacultyModeratorPage())),
+              icon: const Icon(Icons.admin_panel_settings_outlined),
+            ),
           IconButton(
             tooltip: 'Back to home',
             onPressed: () =>

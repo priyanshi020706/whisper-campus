@@ -18,6 +18,7 @@ class AuthGate extends StatefulWidget {
 class _AuthGateState extends State<AuthGate> {
   Session? _session;
   String? _error;
+  bool _profileSyncComplete = false;
   StreamSubscription<AuthState>? _authSubscription;
   final Set<String> _syncingProfileIds = {};
   final Set<String> _syncedProfileIds = {};
@@ -30,6 +31,7 @@ class _AuthGateState extends State<AuthGate> {
 
     _session = _supabase.auth.currentSession;
     final initialSession = _session;
+    _profileSyncComplete = initialSession == null;
     if (initialSession != null) {
       unawaited(_syncCollegeDetails(initialSession));
     }
@@ -40,6 +42,8 @@ class _AuthGateState extends State<AuthGate> {
 
         setState(() {
           _session = data.session;
+          _profileSyncComplete = data.session == null ||
+              _syncedProfileIds.contains(data.session?.user.id ?? '');
           _error = null;
         });
         final session = data.session;
@@ -64,13 +68,18 @@ class _AuthGateState extends State<AuthGate> {
     }
 
     try {
-      final synced = await syncCollegeProfileDetails(
+      await syncCollegeProfileDetails(
         supabase: _supabase,
-        user: session.user,
       );
-      if (synced) _syncedProfileIds.add(userId);
+      _syncedProfileIds.add(userId);
+    } catch (error) {
+      if (mounted) {
+        setState(() => _error =
+            'Could not verify your MITS Google account. Please sign in again.\n\nDetails: $error');
+      }
     } finally {
       _syncingProfileIds.remove(userId);
+      if (mounted) setState(() => _profileSyncComplete = true);
     }
   }
 
@@ -100,10 +109,14 @@ class _AuthGateState extends State<AuthGate> {
       return const SignUpPage();
     }
 
+    if (!_profileSyncComplete) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
     return FutureBuilder(
       future: _supabase
           .from('profiles')
-          .select('profile_completed')
+          .select('profile_completed, role')
           .eq('id', _session!.user.id)
           .maybeSingle(),
       builder: (context, snapshot) {
@@ -129,9 +142,10 @@ class _AuthGateState extends State<AuthGate> {
         }
 
         final profile = snapshot.data;
+        final isFaculty = profile?['role'] == 'faculty';
 
         if (profile == null || profile['profile_completed'] != true) {
-          return const ProfileSetupPage();
+          return ProfileSetupPage(isFaculty: isFaculty);
         }
 
         return FutureBuilder(
@@ -158,7 +172,7 @@ class _AuthGateState extends State<AuthGate> {
             }
             final rows = identitySnapshot.data;
             if (rows is! List || rows.isEmpty) {
-              return const ProfileSetupPage();
+              return ProfileSetupPage(isFaculty: isFaculty);
             }
             return const HomeFeedPage();
           },

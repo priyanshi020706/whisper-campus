@@ -3,9 +3,12 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../home/home_feed_page.dart';
 import '../../services/college_profile_sync.dart';
+import '../../models/campus_department.dart';
 
 class ProfileSetupPage extends StatefulWidget {
-  const ProfileSetupPage({super.key});
+  const ProfileSetupPage({super.key, this.isFaculty = false});
+
+  final bool isFaculty;
 
   @override
   State<ProfileSetupPage> createState() => _ProfileSetupPageState();
@@ -19,6 +22,7 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
 
   bool _loading = false;
   String? _error;
+  String? _departmentCode;
 
   @override
   void dispose() {
@@ -47,19 +51,30 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
     });
 
     try {
-      await _supabase.rpc(
-        'save_my_identity',
-        params: {
-          'p_first_name': _firstNameController.text.trim(),
-          'p_last_name': _lastNameController.text.trim(),
-          'p_bio': _bioController.text.trim().isEmpty
-              ? null
-              : _bioController.text.trim(),
-        },
-      );
+      if (widget.isFaculty) {
+        await _supabase.rpc(
+          'save_my_faculty_profile',
+          params: {
+            'p_first_name': _firstNameController.text.trim(),
+            'p_last_name': _lastNameController.text.trim(),
+            'p_department_code': _departmentCode,
+          },
+        );
+      } else {
+        await _supabase.rpc(
+          'save_my_identity',
+          params: {
+            'p_first_name': _firstNameController.text.trim(),
+            'p_last_name': _lastNameController.text.trim(),
+            'p_bio': _bioController.text.trim().isEmpty
+                ? null
+                : _bioController.text.trim(),
+          },
+        );
+      }
 
       // Retry after setup in case the profile row was created after sign-in.
-      await syncCollegeProfileDetails(supabase: _supabase, user: user);
+      await syncCollegeProfileDetails(supabase: _supabase);
 
       if (!mounted) return;
 
@@ -84,7 +99,9 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Set Up Your Profile')),
+      appBar: AppBar(
+        title: Text(widget.isFaculty ? 'Set Up Your Faculty Profile' : 'Set Up Your Profile'),
+      ),
       body: Center(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
@@ -104,10 +121,10 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
                 style: Theme.of(context).textTheme.headlineSmall,
               ),
               const SizedBox(height: 8),
-              const Text(
-                'Choose the name your classmates will see in Official mode. '
-                'Your branch and year are detected from your MITS email. '
-                'Your anonymous profile stays separate.',
+              Text(
+                widget.isFaculty
+                    ? 'Enter the name people will see in Official rooms. Your department is optional.'
+                    : 'Choose the name your classmates will see in Official mode. Student branch and year are verified from your MITS email when available. Your anonymous profile stays separate.',
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 24),
@@ -132,17 +149,43 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
                   border: OutlineInputBorder(),
                 ),
               ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _bioController,
-                maxLength: 160,
-                maxLines: 3,
-                decoration: const InputDecoration(
-                  labelText: 'Bio (optional)',
-                  hintText: 'A little about you...',
-                  border: OutlineInputBorder(),
+              if (widget.isFaculty) ...[
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String?>(
+                  value: _departmentCode,
+                  decoration: const InputDecoration(
+                    labelText: 'Department (optional)',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: [
+                    const DropdownMenuItem<String?>(
+                      value: null,
+                      child: Text('No department selected'),
+                    ),
+                    ...campusDepartments.map(
+                      (department) => DropdownMenuItem<String?>(
+                        value: department.code,
+                        child: Text('${department.name} (${department.code.toUpperCase()})'),
+                      ),
+                    ),
+                  ],
+                  onChanged: _loading
+                      ? null
+                      : (value) => setState(() => _departmentCode = value),
                 ),
-              ),
+              ] else ...[
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _bioController,
+                  maxLength: 160,
+                  maxLines: 3,
+                  decoration: const InputDecoration(
+                    labelText: 'Bio (optional)',
+                    hintText: 'A little about you...',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ],
               if (_error != null) ...[
                 const SizedBox(height: 8),
                 Text(_error!, style: const TextStyle(color: Colors.red)),

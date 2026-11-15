@@ -16,7 +16,11 @@ import '../../models/post_content.dart';
 import '../profile/profile_post_detail_page.dart';
 import '../profile/profile_page.dart';
 import '../rooms/department_rooms_page.dart';
+import '../rooms/faculty_moderator_page.dart';
 import '../rooms/room_chat_page.dart';
+import '../rooms/room_post_review_page.dart';
+import '../rooms/room_moderator_contact_page.dart';
+import '../rooms/moderator_inbox_page.dart';
 import 'live_room_preview.dart';
 import 'post_media_frame.dart';
 
@@ -42,12 +46,19 @@ class HomeFeedPage extends StatefulWidget {
   State<HomeFeedPage> createState() => _HomeFeedPageState();
 }
 
-class _HomeFeedPageState extends State<HomeFeedPage> {
+class _HomeFeedPageState extends State<HomeFeedPage>
+    with SingleTickerProviderStateMixin {
   final _supabase = Supabase.instance.client;
   final _homeScrollController = ScrollController();
   List<_CampusRoom> _rooms = [];
   String? _selectedRoomId;
   String? _myAvatarSeed;
+  bool _isFaculty = false;
+  bool _isSuperAdmin = false;
+  bool _hasModeratorInbox = false;
+  bool _canReviewRoomPosts = false;
+  bool _identityLoaded = false;
+  String? _identityError;
   List<_CampusPost> _posts = [];
   List<_OfficialPost> _officialPosts = [];
   final Set<String> _likingPostIds = {};
@@ -57,6 +68,10 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
   bool _livePanelOpen = false;
   bool _drawerOpen = false;
   bool _chatJoined = false;
+  late final TabController _roomTabController;
+  Timer? _roomUnreadTimer;
+  bool _roomChatSelected = false;
+  int _roomUnreadCount = 0;
   _CampusMode _mode = _CampusMode.unofficial;
   String? _error;
   String? _officialError;
@@ -64,29 +79,118 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
   @override
   void initState() {
     super.initState();
-    unawaited(_loadMyAvatarSeed());
-    _loadRooms();
+    _roomTabController = TabController(length: 2, vsync: this)
+      ..addListener(_handleRoomTabChanged);
+    if (widget.roomPage) {
+      _roomUnreadTimer = Timer.periodic(
+        const Duration(seconds: 20),
+        (_) => _loadRoomUnreadCount(),
+      );
+    }
+    unawaited(_loadMyAvatarSeed(initializeHome: true));
   }
 
-  Future<void> _loadMyAvatarSeed() async {
+  void _handleRoomTabChanged() {
+    if (_roomTabController.indexIsChanging) return;
+    final chatSelected = _roomTabController.index == 1;
+    if (_roomChatSelected == chatSelected || !mounted) return;
+    setState(() {
+      _roomChatSelected = chatSelected;
+      if (chatSelected) _roomUnreadCount = 0;
+    });
+    if (!chatSelected) {
+      Future<void>.delayed(
+        const Duration(milliseconds: 250),
+        _loadRoomUnreadCount,
+      );
+    }
+  }
+
+  Future<void> _loadRoomUnreadCount() async {
+    final roomId = _selectedRoomId;
+    if (!widget.roomPage || _roomChatSelected || roomId == null) return;
+    try {
+      final value = await _supabase.rpc(
+        'get_room_chat_unread',
+        params: {'p_room_id': roomId, 'p_mode': _mode.name},
+      );
+      if (!mounted || _roomChatSelected) return;
+      setState(() => _roomUnreadCount = (value as num?)?.toInt() ?? 0);
+    } catch (_) {
+      // Unread badges are optional; keep the room and posts usable if the
+      // chat migration has not been applied to the connected Supabase project.
+    }
+  }
+
+  Future<void> _loadMyAvatarSeed({bool initializeHome = false}) async {
     final userId = _supabase.auth.currentUser?.id;
-    if (userId == null) return;
+    if (userId == null) {
+      if (initializeHome && mounted) {
+        setState(() {
+          _identityError = 'Please sign in again.';
+          _identityLoaded = true;
+        });
+      }
+      return;
+    }
     try {
       final row = await _supabase
           .from('profiles')
-          .select('avatar_seed')
+          .select('avatar_seed, role')
           .eq('id', userId)
           .maybeSingle();
+      final role = row?['role']?.toString();
+      final isFaculty = role == 'faculty';
+      final isSuperAdmin = role == 'super_admin';
+      var hasModeratorInbox = false;
+      try {
+        final rooms = await _supabase.rpc('list_my_moderated_rooms');
+        hasModeratorInbox = rooms is List && rooms.isNotEmpty;
+      } catch (_) {}
       if (mounted) {
-        setState(() => _myAvatarSeed = row?['avatar_seed'] as String?);
+        setState(() {
+          _myAvatarSeed = row?['avatar_seed'] as String?;
+          _isFaculty = isFaculty;
+          _isSuperAdmin = isSuperAdmin;
+          _hasModeratorInbox = hasModeratorInbox;
+          if (initializeHome) {
+            _mode = widget.roomPage
+                ? _CampusMode.unofficial
+                : (isFaculty || isSuperAdmin)
+                    ? _CampusMode.official
+                    : _CampusMode.unofficial;
+            _identityLoaded = true;
+            _identityError = row == null
+                ? 'Could not load your profile.'
+                : null;
+          }
+        });
+      }
+      if (initializeHome && row != null) {
+        if (widget.roomPage) {
+          await _loadRooms();
+        } else if (isFaculty || isSuperAdmin) {
+          await _loadOfficialPosts();
+        } else {
+          await _loadRooms();
+        }
       }
     } catch (_) {
-      // A missing avatar should fall back to the standard student icon.
+      if (initializeHome && mounted) {
+        setState(() {
+          _identityError = 'Could not verify your account. Please try again.';
+          _identityLoaded = true;
+        });
+      }
     }
   }
 
   @override
   void dispose() {
+    _roomUnreadTimer?.cancel();
+    _roomTabController
+      ..removeListener(_handleRoomTabChanged)
+      ..dispose();
     _homeScrollController.dispose();
     super.dispose();
   }
@@ -117,7 +221,11 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
             ? 'general'
             : (rooms.isEmpty ? null : rooms.first.id);
       });
+      if (widget.roomPage && _selectedRoomId != null) {
+        await _checkRoomReviewAccess(_selectedRoomId!);
+      }
       await _loadPosts();
+      if (widget.roomPage) await _loadRoomUnreadCount();
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -127,6 +235,43 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
     }
   }
 
+  Future<void> _checkRoomReviewAccess(String roomId) async {
+    try {
+      final result = await _supabase.rpc('is_active_room_moderator', params: {
+        'p_room': roomId,
+        'p_mode': _mode.name,
+      });
+      if (mounted) setState(() => _canReviewRoomPosts = _isSuperAdmin || result == true);
+    } catch (_) {
+      if (mounted) setState(() => _canReviewRoomPosts = _isSuperAdmin);
+    }
+  }
+
+  Future<void> _openRoomPostReview() async {
+    final roomId = _selectedRoomId;
+    if (roomId == null) return;
+    await Navigator.of(context).push<void>(MaterialPageRoute<void>(
+      builder: (_) => RoomPostReviewPage(
+        roomId: roomId,
+        roomName: widget.initialRoomName ?? _selectedRoomName,
+        mode: _mode.name,
+      ),
+    ));
+    if (mounted) await _loadPosts(showLoading: false);
+  }
+
+  Future<void> _openModeratorContact() async {
+    final roomId = _selectedRoomId;
+    if (roomId == null) return;
+    await Navigator.of(context).push<void>(MaterialPageRoute<void>(
+      builder: (_) => RoomModeratorContactPage(
+        roomId: roomId,
+        roomName: widget.initialRoomName ?? _selectedRoomName,
+        mode: _mode.name,
+      ),
+    ));
+  }
+
   Future<void> _changeMode(_CampusMode mode) async {
     if (_mode == mode) return;
     setState(() {
@@ -134,7 +279,20 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
       _livePanelOpen = false;
       _chatJoined = false;
     });
-    if (mode == _CampusMode.official) await _loadOfficialPosts();
+    if (widget.roomPage) {
+      final roomId = _selectedRoomId;
+      if (roomId != null) await _checkRoomReviewAccess(roomId);
+      return;
+    }
+    if (mode == _CampusMode.official) {
+      await _loadOfficialPosts();
+    } else {
+      if (_rooms.isEmpty) {
+        await _loadRooms();
+      } else {
+        await _loadPosts();
+      }
+    }
   }
 
   Future<void> _loadOfficialPosts({bool showLoading = true}) async {
@@ -147,7 +305,13 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
     try {
       final rows = await _supabase.rpc(
         'get_official_posts_with_activity',
-        params: {'p_department_code': null, 'p_limit': 50},
+        params: {
+          'p_department_code': (_selectedRoomId ?? '').startsWith('dept-')
+              ? (_selectedRoomId ?? '').substring(5)
+              : null,
+          'p_limit': 50,
+          'p_room_id': _selectedRoomId ?? 'general',
+        },
       );
       final posts = List<Map<String, dynamic>>.from(rows).map((row) {
         return _OfficialPost(
@@ -155,7 +319,7 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
           departmentCode: row['department_code'] as String?,
           authorName: row['author_name'] as String,
           branch: row['author_branch'] as String,
-          academicYear: (row['author_year'] as num).toInt(),
+          academicYear: (row['author_year'] as num?)?.toInt() ?? 0,
           content: row['content'] as String,
           createdAt: DateTime.parse(row['created_at'] as String),
           imagePath: row['image_path'] as String?,
@@ -200,6 +364,8 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
           department: department,
           onCreatePost: () => _openCreatePost(departmentCode: department.code),
           onOpenPost: _openOfficialPost,
+          canAdminDelete: _isSuperAdmin,
+          onAdminDelete: _deleteOfficialPost,
           onNavigateHome: () =>
               Navigator.of(context).popUntil((route) => route.isFirst),
           onOpenLiveChat: () {
@@ -209,6 +375,7 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
         ),
       ),
     );
+    if (mounted) await _loadOfficialPosts(showLoading: false);
   }
 
   Future<void> _openOfficialPost(_OfficialPost post) async {
@@ -603,6 +770,9 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
 
     final roomId = _selectedRoomId;
     if (modeAtOpen == _CampusMode.unofficial && roomId == null) return;
+    final officialRoomId = departmentCode != null
+        ? 'dept-$departmentCode'
+        : (roomId ?? 'general');
 
     setState(() => _posting = true);
     String? uploadedImagePath;
@@ -616,7 +786,7 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
           _ => 'image/webp',
         };
         uploadedImagePath = modeAtOpen == _CampusMode.official
-            ? '${user.id}/posts/$postId/$postId.$extension'
+            ? '${user.id}/$officialRoomId/posts/$postId/$postId.$extension'
             : 'posts/$postId/$postId.$extension';
         await _supabase.storage
             .from(
@@ -638,6 +808,7 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
             'p_content': draft.encodedContent,
             'p_image_path': uploadedImagePath,
             'p_department_code': departmentCode,
+            'p_room_id': officialRoomId,
           },
         );
         await _loadOfficialPosts(showLoading: false);
@@ -649,6 +820,25 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
           'image_path': uploadedImagePath,
         });
         await _loadPosts(showLoading: false);
+      }
+      if (mounted) {
+        var directPost = _isFaculty || _isSuperAdmin;
+        if (!directPost) {
+          try {
+            directPost = await _supabase.rpc('is_active_room_moderator', params: {
+              'p_room': modeAtOpen == _CampusMode.official ? officialRoomId : roomId,
+              'p_mode': modeAtOpen.name,
+            }) == true;
+          } catch (_) {}
+        }
+        if (mounted) {
+          final isPending = !directPost;
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(isPending
+                ? 'Post submitted. It will appear after this room’s moderator approves it.'
+                : 'Post published.'),
+          ));
+        }
       }
     } catch (error) {
       debugPrint('Post publishing failed: $error');
@@ -785,8 +975,10 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
 
     try {
       final imagePath = await _supabase.rpc(
-        'delete_my_post',
-        params: {'p_post_id': post.id},
+        _isSuperAdmin ? 'admin_delete_post' : 'delete_my_post',
+        params: _isSuperAdmin
+            ? {'p_post_id': post.id, 'p_mode': 'unofficial'}
+            : {'p_post_id': post.id},
       ) as String?;
       if (imagePath != null) {
         try {
@@ -805,6 +997,32 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
           const SnackBar(content: Text('Could not delete this post.')),
         );
       }
+    }
+  }
+
+  Future<void> _deleteOfficialPost(_OfficialPost post) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Delete this post?'),
+        content: const Text('This will permanently remove the post and its replies.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      final path = await _supabase.rpc('admin_delete_post', params: {'p_post_id': post.id, 'p_mode': 'official'}) as String?;
+      if (path != null) {
+        try { await _supabase.storage.from(_officialPostImageBucket).remove([path]); } catch (_) {}
+      }
+      if (!mounted) return;
+      setState(() => _officialPosts.removeWhere((item) => item.id == post.id));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Post deleted.')));
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not delete post: $error')));
     }
   }
 
@@ -888,6 +1106,18 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
     }
   }
 
+  Future<void> _openFacultyModeratorPage() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(builder: (_) => const FacultyModeratorPage()),
+    );
+  }
+
+  Future<void> _openModeratorInbox() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(builder: (_) => const ModeratorInboxPage()),
+    );
+  }
+
   void _toggleLivePanel() {
     setState(() {
       _livePanelOpen = !_livePanelOpen;
@@ -897,6 +1127,19 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
 
   @override
   Widget build(BuildContext context) {
+    if (!_identityLoaded) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (_identityError != null) {
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Text(_identityError!, textAlign: TextAlign.center),
+          ),
+        ),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         leading: widget.roomPage
@@ -933,6 +1176,12 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
             },
             icon: const Icon(Icons.home_outlined),
           ),
+          if (!widget.roomPage && _hasModeratorInbox)
+            IconButton(
+              tooltip: 'Moderator inbox',
+              onPressed: _openModeratorInbox,
+              icon: const Icon(Icons.inbox_outlined),
+            ),
           if (widget.roomPage)
             Builder(
               builder: (context) => IconButton(
@@ -941,7 +1190,25 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
                 icon: const Icon(Icons.menu_rounded),
               ),
             ),
+          if (widget.roomPage && _canReviewRoomPosts)
+            IconButton(
+              tooltip: 'Review pending posts',
+              onPressed: _openRoomPostReview,
+              icon: const Icon(Icons.fact_check_outlined),
+            ),
+          if (widget.roomPage)
+            IconButton(
+              tooltip: 'Contact moderator',
+              onPressed: _openModeratorContact,
+              icon: const Icon(Icons.support_agent_outlined),
+            ),
           CampusLiveAction(active: _livePanelOpen, onPressed: _toggleLivePanel),
+          if (!widget.roomPage && _mode == _CampusMode.official && (_isFaculty || _isSuperAdmin))
+            IconButton(
+              tooltip: 'Manage room moderators',
+              onPressed: _openFacultyModeratorPage,
+              icon: const Icon(Icons.admin_panel_settings_outlined),
+            ),
           IconButton(
             tooltip: Theme.of(context).brightness == Brightness.dark
                 ? 'Switch to light theme'
@@ -987,6 +1254,8 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
       ),
       floatingActionButton: _livePanelOpen
           ? null
+          : widget.roomPage && _roomChatSelected
+          ? null
           : FloatingActionButton.extended(
               onPressed: _posting ? null : _openCreatePost,
               icon: _posting
@@ -1005,7 +1274,12 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
     final colors = Theme.of(context).colorScheme;
     final official = _mode == _CampusMode.official;
     final rooms = _rooms
-        .where((room) => room.id != 'general' && !room.id.startsWith('dept-'))
+        .where(
+          (room) =>
+              room.id != 'general' &&
+              room.id != 'official-live' &&
+              !room.id.startsWith('dept-'),
+        )
         .toList();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1245,21 +1519,25 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
 
   Widget _buildLivePanel() {
     final colors = Theme.of(context).colorScheme;
+    final official = _mode == _CampusMode.official;
+    final roomId = official ? 'official-live' : 'general';
+    final roomName = official ? 'Official Campus Live' : 'Campus-wide';
     return Material(
       elevation: 12,
       color: colors.surface,
       child: _chatJoined
           ? RoomChatPage(
-              roomId: 'general',
-              roomName: 'Campus-wide',
+              roomId: roomId,
+              roomName: roomName,
               embedded: true,
               onClose: _toggleLivePanel,
             )
           : LiveRoomPreview(
-              key: const ValueKey('campus-live-side-panel'),
-              roomId: 'general',
-              roomName: 'Campus-wide',
+              key: ValueKey('campus-live-side-panel-' + roomId),
+              roomId: roomId,
+              roomName: roomName,
               expanded: true,
+              hideMessagesUntilJoined: official,
               onClose: _toggleLivePanel,
               onJoin: () => setState(() => _chatJoined = true),
             ),
@@ -1267,29 +1545,75 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
   }
 
   Widget _buildRoomPage() {
-    return RefreshIndicator(
-      onRefresh: () => _loadPosts(),
-      child: ListView(
-        controller: _homeScrollController,
-        physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 104),
-        children: [
-          Text(
-            'Anonymous conversations',
-            style: Theme.of(context).textTheme.titleLarge
-                ?.copyWith(fontWeight: FontWeight.w800),
+    final colors = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Anonymous conversations',
+                style: Theme.of(context).textTheme.titleLarge
+                    ?.copyWith(fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Posts from ${widget.initialRoomName ?? _selectedRoomName}. Your identity stays anonymous.',
+                style: Theme.of(context).textTheme.bodyMedium
+                    ?.copyWith(color: colors.onSurfaceVariant),
+              ),
+            ],
           ),
-          const SizedBox(height: 4),
-          Text(
-            'Posts from ${widget.initialRoomName ?? _selectedRoomName}. Your identity stays anonymous.',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+        TabBar(
+          controller: _roomTabController,
+          isScrollable: true,
+          tabAlignment: TabAlignment.start,
+          tabs: [
+            const Tab(text: 'Posts'),
+            Tab(
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('Chat'),
+                  if (_roomUnreadCount > 0) ...[
+                    const SizedBox(width: 7),
+                    _UnreadMessageBadge(count: _roomUnreadCount),
+                  ],
+                ],
+              ),
             ),
-          ),
-          const SizedBox(height: 16),
-          _buildFeedSection(),
-        ],
-      ),
+          ],
+        ),
+        Expanded(
+          child: _roomChatSelected
+              ? RoomChatPage(
+                  key: ValueKey('unofficial-room-chat-$_selectedRoomId'),
+                  roomId: _selectedRoomId ?? 'general',
+                  roomName: widget.initialRoomName ?? _selectedRoomName,
+                  embedded: true,
+                  roomConversation: true,
+                  roomMode: 'unofficial',
+                  onRead: () {
+                    if (mounted && _roomUnreadCount != 0) {
+                      setState(() => _roomUnreadCount = 0);
+                    }
+                  },
+                )
+              : RefreshIndicator(
+                  onRefresh: _loadPosts,
+                  child: ListView(
+                    controller: _homeScrollController,
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 104),
+                    children: [_buildFeedSection()],
+                  ),
+                ),
+        ),
+      ],
     );
   }
 
@@ -1433,6 +1757,46 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
             ),
           ),
         ),
+        if (_isFaculty || _isSuperAdmin) ...[
+          const SizedBox(height: 12),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(18, 16, 12, 16),
+              child: Row(
+                children: [
+                  CircleAvatar(
+                    backgroundColor: colors.secondaryContainer,
+                    foregroundColor: colors.onSecondaryContainer,
+                    child: const Icon(Icons.admin_panel_settings_outlined),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Faculty dashboard',
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w800),
+                        ),
+                        const SizedBox(height: 3),
+                        const Text(
+                          'Post to Official rooms and manage moderators.',
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton.tonalIcon(
+                    onPressed: _openFacultyModeratorPage,
+                    icon: const Icon(Icons.manage_accounts_outlined),
+                    label: const Text('Moderators'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
         const SizedBox(height: 18),
         _buildSectionHeading(
           'Explore the departments',
@@ -1537,6 +1901,8 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
                     _OfficialPostCard(
                       post: post,
                       onTap: () => _openOfficialPost(post),
+                      canAdminDelete: _isSuperAdmin,
+                      onAdminDelete: () => _deleteOfficialPost(post),
                     ),
                   ],
                 ],
@@ -1707,7 +2073,7 @@ class _HomeFeedPageState extends State<HomeFeedPage> {
                           style: Theme.of(context).textTheme.labelSmall
                               ?.copyWith(color: colors.onSurfaceVariant),
                         ),
-                        if (post.isMine)
+                        if (post.isMine || _isSuperAdmin)
                           PopupMenuButton<String>(
                             tooltip: 'Post options',
                             onSelected: (value) {
@@ -1930,10 +2296,12 @@ class _OfficialPost {
 }
 
 class _OfficialPostCard extends StatelessWidget {
-  const _OfficialPostCard({required this.post, required this.onTap});
+  const _OfficialPostCard({required this.post, required this.onTap, this.canAdminDelete = false, this.onAdminDelete});
 
   final _OfficialPost post;
   final VoidCallback onTap;
+  final bool canAdminDelete;
+  final VoidCallback? onAdminDelete;
 
   String _dateLabel() {
     final date = post.createdAt.toLocal();
@@ -1987,7 +2355,11 @@ class _OfficialPostCard extends StatelessWidget {
                                 ?.copyWith(fontWeight: FontWeight.w800),
                           ),
                           Text(
-                            '${post.branch} · Year ${post.academicYear}',
+                            post.academicYear <= 0
+                                ? (post.branch.isEmpty
+                                      ? 'Faculty'
+                                      : post.branch)
+                                : '${post.branch} · Year ${post.academicYear}',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: Theme.of(context).textTheme.bodySmall
@@ -1996,6 +2368,12 @@ class _OfficialPostCard extends StatelessWidget {
                         ],
                       ),
                     ),
+                    if (canAdminDelete && onAdminDelete != null)
+                      PopupMenuButton<String>(
+                        tooltip: 'Post options',
+                        onSelected: (value) { if (value == 'delete') onAdminDelete?.call(); },
+                        itemBuilder: (_) => const [PopupMenuItem(value: 'delete', child: Text('Delete post'))],
+                      ),
                     Text(
                       _dateLabel(),
                       style: Theme.of(context).textTheme.labelSmall,
@@ -2096,6 +2474,8 @@ class _OfficialDepartmentPage extends StatefulWidget {
     required this.onOpenPost,
     required this.onNavigateHome,
     required this.onOpenLiveChat,
+    required this.canAdminDelete,
+    required this.onAdminDelete,
   });
 
   final CampusDepartment department;
@@ -2103,22 +2483,103 @@ class _OfficialDepartmentPage extends StatefulWidget {
   final Future<void> Function(_OfficialPost post) onOpenPost;
   final VoidCallback onNavigateHome;
   final VoidCallback onOpenLiveChat;
+  final bool canAdminDelete;
+  final Future<void> Function(_OfficialPost post) onAdminDelete;
 
   @override
   State<_OfficialDepartmentPage> createState() =>
       _OfficialDepartmentPageState();
 }
 
-class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage> {
+class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
+    with SingleTickerProviderStateMixin {
   final _supabase = Supabase.instance.client;
   List<_OfficialPost> _posts = [];
   bool _loading = true;
   String? _error;
+  late final TabController _tabController;
+  Timer? _unreadTimer;
+  bool _chatSelected = false;
+  int _unreadCount = 0;
+  bool _canReviewPosts = false;
 
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 2, vsync: this)
+      ..addListener(_handleTabChanged);
+    _unreadTimer = Timer.periodic(
+      const Duration(seconds: 20),
+      (_) => _loadUnreadCount(),
+    );
     _loadPosts();
+    _loadUnreadCount();
+    _loadReviewAccess();
+  }
+
+  Future<void> _loadReviewAccess() async {
+    final roomId = 'dept-' + widget.department.code;
+    try {
+      final moderator = await _supabase.rpc('is_active_room_moderator', params: {
+        'p_room': roomId,
+        'p_mode': 'official',
+      });
+      final admin = await _supabase.rpc('is_super_admin');
+      if (mounted) setState(() => _canReviewPosts = moderator == true || admin == true);
+    } catch (_) {
+      // Keep regular room browsing available if the optional review check fails.
+    }
+  }
+
+  Future<void> _openReviewQueue() async {
+    await Navigator.of(context).push<void>(MaterialPageRoute<void>(
+      builder: (_) => RoomPostReviewPage(
+        roomId: 'dept-' + widget.department.code,
+        roomName: widget.department.name,
+        mode: 'official',
+      ),
+    ));
+    if (mounted) await _loadPosts();
+  }
+
+  Future<void> _openModeratorContact() async {
+    await Navigator.of(context).push<void>(MaterialPageRoute<void>(
+      builder: (_) => RoomModeratorContactPage(
+        roomId: 'dept-' + widget.department.code,
+        roomName: widget.department.name,
+        mode: 'official',
+      ),
+    ));
+  }
+
+  void _handleTabChanged() {
+    if (_tabController.indexIsChanging) return;
+    final chatSelected = _tabController.index == 1;
+    if (_chatSelected == chatSelected || !mounted) return;
+    setState(() {
+      _chatSelected = chatSelected;
+      if (chatSelected) _unreadCount = 0;
+    });
+    if (!chatSelected) {
+      Future<void>.delayed(const Duration(milliseconds: 250), _loadUnreadCount);
+    }
+  }
+
+  Future<void> _loadUnreadCount() async {
+    if (_chatSelected) return;
+    try {
+      final unread = await _supabase.rpc(
+        'get_room_chat_unread',
+        params: {
+          'p_room_id': 'dept-' + widget.department.code,
+          'p_mode': 'official',
+        },
+      );
+      if (!mounted || _chatSelected) return;
+      setState(() => _unreadCount = (unread as num?)?.toInt() ?? 0);
+    } catch (_) {
+      // The feed remains available while the optional unread count refreshes.
+    }
   }
 
   Future<void> _loadPosts() async {
@@ -2129,7 +2590,11 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage> {
     try {
       final rows = await _supabase.rpc(
         'get_official_posts_with_activity',
-        params: {'p_department_code': widget.department.code, 'p_limit': 100},
+        params: {
+          'p_department_code': widget.department.code,
+          'p_limit': 100,
+          'p_room_id': 'dept-' + widget.department.code,
+        },
       );
       final posts = List<Map<String, dynamic>>.from(rows).map((row) {
         return _OfficialPost(
@@ -2137,7 +2602,7 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage> {
           departmentCode: row['department_code'] as String?,
           authorName: row['author_name'] as String,
           branch: row['author_branch'] as String,
-          academicYear: (row['author_year'] as num).toInt(),
+          academicYear: (row['author_year'] as num?)?.toInt() ?? 0,
           content: row['content'] as String,
           createdAt: DateTime.parse(row['created_at'] as String),
           imagePath: row['image_path'] as String?,
@@ -2180,6 +2645,15 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage> {
   }
 
   @override
+  void dispose() {
+    _unreadTimer?.cancel();
+    _tabController
+      ..removeListener(_handleTabChanged)
+      ..dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
@@ -2190,39 +2664,114 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage> {
             onPressed: widget.onNavigateHome,
             icon: const Icon(Icons.home_outlined),
           ),
+          if (_canReviewPosts)
+            IconButton(
+              tooltip: 'Review pending posts',
+              onPressed: _openReviewQueue,
+              icon: const Icon(Icons.fact_check_outlined),
+            ),
+          IconButton(
+            tooltip: 'Contact moderator',
+            onPressed: _openModeratorContact,
+            icon: const Icon(Icons.support_agent_outlined),
+          ),
           CampusLiveAction(active: false, onPressed: widget.onOpenLiveChat),
         ],
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _error != null
-          ? Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(_error!),
-                  TextButton(onPressed: _loadPosts, child: const Text('Retry')),
-                ],
-              ),
-            )
-          : _posts.isEmpty
-          ? const Center(child: Text('No posts in this department yet.'))
-          : RefreshIndicator(
-              onRefresh: _loadPosts,
-              child: ListView.separated(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
-                itemCount: _posts.length,
-                separatorBuilder: (context, index) => const SizedBox(height: 8),
-                itemBuilder: (context, index) => _OfficialPostCard(
-                  post: _posts[index],
-                  onTap: () => widget.onOpenPost(_posts[index]),
-                ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: Text(
+              'Department room · Real names visible',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
               ),
             ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _createPost,
-        icon: const Icon(Icons.add),
-        label: const Text('Post to department'),
+          ),
+          TabBar(
+            controller: _tabController,
+            isScrollable: true,
+            tabAlignment: TabAlignment.start,
+            tabs: [
+              const Tab(text: 'Posts'),
+              Tab(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('Chat'),
+                    if (_unreadCount > 0) ...[
+                      const SizedBox(width: 7),
+                      _UnreadMessageBadge(count: _unreadCount),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+          Expanded(
+            child: _chatSelected
+                ? RoomChatPage(
+                    key: ValueKey(
+                      'official-room-chat-${widget.department.code}',
+                    ),
+                    roomId: 'dept-' + widget.department.code,
+                    roomName: widget.department.name,
+                    embedded: true,
+                    roomConversation: true,
+                    roomMode: 'official',
+                    onRead: () {
+                      if (mounted && _unreadCount != 0) {
+                        setState(() => _unreadCount = 0);
+                      }
+                    },
+                  )
+                : _buildPostTab(),
+          ),
+        ],
+      ),
+      floatingActionButton: _chatSelected
+          ? null
+          : FloatingActionButton.extended(
+              onPressed: _createPost,
+              icon: const Icon(Icons.add),
+              label: const Text('Post to department'),
+            ),
+    );
+  }
+
+  Widget _buildPostTab() {
+    if (_loading) return const Center(child: CircularProgressIndicator());
+    if (_error != null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(_error!),
+            TextButton(onPressed: _loadPosts, child: const Text('Retry')),
+          ],
+        ),
+      );
+    }
+    if (_posts.isEmpty) {
+      return const Center(child: Text('No posts in this department yet.'));
+    }
+    return RefreshIndicator(
+      onRefresh: _loadPosts,
+      child: ListView.separated(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
+        itemCount: _posts.length,
+        separatorBuilder: (context, index) => const SizedBox(height: 8),
+        itemBuilder: (context, index) => _OfficialPostCard(
+          post: _posts[index],
+          onTap: () => widget.onOpenPost(_posts[index]),
+          canAdminDelete: widget.canAdminDelete,
+          onAdminDelete: () async {
+            await widget.onAdminDelete(_posts[index]);
+            if (mounted) await _loadPosts();
+          },
+        ),
       ),
     );
   }
@@ -2515,6 +3064,31 @@ class _CampusRoom {
 
   final String id;
   final String name;
+}
+
+class _UnreadMessageBadge extends StatelessWidget {
+  const _UnreadMessageBadge({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Container(
+      constraints: const BoxConstraints(minWidth: 19, minHeight: 19),
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: colors.primary,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        count > 99 ? '99+' : '$count',
+        style: Theme.of(context).textTheme.labelSmall
+            ?.copyWith(color: colors.onPrimary, fontWeight: FontWeight.w800),
+      ),
+    );
+  }
 }
 
 class _HoverablePostSurface extends StatefulWidget {

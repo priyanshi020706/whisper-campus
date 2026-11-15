@@ -3,6 +3,7 @@ class ProfileModel {
   final String anonUsername;
   final String avatarSeed;
   final String role;
+  final String? branchCode;
   final String? department;
   final int? academicYear;
   final String? bio;
@@ -12,6 +13,7 @@ class ProfileModel {
     required this.anonUsername,
     required this.avatarSeed,
     required this.role,
+    this.branchCode,
     this.department,
     this.academicYear,
     this.bio,
@@ -23,6 +25,7 @@ class ProfileModel {
       anonUsername: map['anon_username'] ?? 'Anonymous',
       avatarSeed: map['avatar_seed'] ?? '',
       role: map['role'] ?? 'student',
+      branchCode: map['branch_code'],
       department: map['department'],
       academicYear: map['academic_year'],
       bio: map['bio'],

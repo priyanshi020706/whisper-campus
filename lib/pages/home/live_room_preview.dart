@@ -10,6 +10,7 @@ class LiveRoomPreview extends StatefulWidget {
     required this.roomName,
     required this.onJoin,
     this.expanded = false,
+    this.hideMessagesUntilJoined = false,
     this.onClose,
   });
 
@@ -17,6 +18,7 @@ class LiveRoomPreview extends StatefulWidget {
   final String roomName;
   final VoidCallback onJoin;
   final bool expanded;
+  final bool hideMessagesUntilJoined;
   final VoidCallback? onClose;
 
   @override
@@ -33,11 +35,13 @@ class _LiveRoomPreviewState extends State<LiveRoomPreview> {
   @override
   void initState() {
     super.initState();
-    _loadLatest();
-    _refreshTimer = Timer.periodic(
-      const Duration(seconds: 5),
-      (_) => _loadLatest(),
-    );
+    if (!widget.hideMessagesUntilJoined) {
+      _loadLatest();
+      _refreshTimer = Timer.periodic(
+        const Duration(seconds: 5),
+        (_) => _loadLatest(),
+      );
+    }
   }
 
   @override
@@ -46,7 +50,7 @@ class _LiveRoomPreviewState extends State<LiveRoomPreview> {
     if (oldWidget.roomId != widget.roomId) {
       _messages = [];
       _loading = true;
-      _loadLatest();
+      if (!widget.hideMessagesUntilJoined) _loadLatest();
     }
   }
 
@@ -168,7 +172,9 @@ class _LiveRoomPreviewState extends State<LiveRoomPreview> {
                         ?.copyWith(color: colors.onSurfaceVariant),
                   ),
                   const SizedBox(height: 12),
-                  if (_loading && _messages.isEmpty)
+                  if (widget.hideMessagesUntilJoined)
+                    const Text('Join to view the live conversation.')
+                  else if (_loading && _messages.isEmpty)
                     const Padding(
                       padding: EdgeInsets.symmetric(vertical: 12),
                       child: Center(
@@ -226,7 +232,9 @@ class _LiveRoomPreviewState extends State<LiveRoomPreview> {
           ),
           const SizedBox(height: 14),
           Expanded(
-            child: _loading && _messages.isEmpty
+            child: widget.hideMessagesUntilJoined
+                ? const Center(child: Text('Join to view the live conversation.', textAlign: TextAlign.center))
+                : _loading && _messages.isEmpty
                 ? const Center(child: CircularProgressIndicator())
                 : _failed && _messages.isEmpty
                 ? Center(

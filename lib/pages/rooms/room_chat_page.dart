@@ -10,12 +10,18 @@ class RoomChatPage extends StatefulWidget {
     required this.roomName,
     this.embedded = false,
     this.onClose,
+    this.roomConversation = false,
+    this.roomMode = 'unofficial',
+    this.onRead,
   });
 
   final String roomId;
   final String roomName;
   final bool embedded;
   final VoidCallback? onClose;
+  final bool roomConversation;
+  final String roomMode;
+  final VoidCallback? onRead;
 
   @override
   State<RoomChatPage> createState() => _RoomChatPageState();
@@ -32,13 +38,91 @@ class _RoomChatPageState extends State<RoomChatPage> {
   bool _realtimeConnected = false;
   String? _myUsername;
   String? _error;
+  String? _blockedReason;
+  bool _joinedOfficialSession = false;
+  bool _joinedRoomConversation = false;
+  bool _canModerateRoom = false;
+  bool _isSuperAdmin = false;
 
   @override
   void initState() {
     super.initState();
+    if (widget.roomConversation) {
+      _joinRoomConversation();
+    } else if (widget.roomId == 'official-live') {
+      _joinOfficialSession();
+    } else {
+      _startChat();
+    }
+  }
+
+  void _startChat() {
+    _loadMyRole();
     _subscribe();
     _loadHistory();
     _loadMyUsername();
+  }
+
+  Future<void> _loadMyRole() async {
+    final uid = _supabase.auth.currentUser?.id;
+    if (uid == null) return;
+    try {
+      final row = await _supabase.from('profiles').select('role').eq('id', uid).maybeSingle();
+      final admin = row?['role'] == 'super_admin';
+      if (mounted) setState(() { _isSuperAdmin = admin; if (admin) _canModerateRoom = true; });
+    } catch (_) {}
+  }
+
+  Future<void> _joinRoomConversation() async {
+    try {
+      await _supabase.rpc(
+        'join_room_chat',
+        params: {'p_room_id': widget.roomId, 'p_mode': widget.roomMode},
+      );
+      _joinedRoomConversation = true;
+      widget.onRead?.call();
+      if (mounted) _startChat();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Could not join this room chat. Please try again.';
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _joinOfficialSession() async {
+    try {
+      final blocked = await _supabase.rpc(
+        'get_my_room_block',
+        params: {'p_room_id': widget.roomId},
+      );
+      if (blocked is List && blocked.isNotEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _blockedReason =
+              blocked.first['reason'] as String? ?? 'Room rules violation';
+          _loading = false;
+        });
+        return;
+      }
+      await _supabase.rpc('join_room', params: {'p_room_id': widget.roomId});
+      _joinedOfficialSession = true;
+      final faculty = await _supabase.rpc('is_faculty');
+      final moderator = await _supabase.rpc(
+        'is_active_room_moderator',
+        params: {'p_room': widget.roomId},
+      );
+      if (mounted)
+        setState(() => _canModerateRoom = faculty == true || moderator == true);
+      if (mounted) _startChat();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Could not join this room: ' + error.toString();
+        _loading = false;
+      });
+    }
   }
 
   Future<void> _loadMyUsername() async {
@@ -61,7 +145,9 @@ class _RoomChatPageState extends State<RoomChatPage> {
   void _subscribe() {
     _channel = _supabase
         .channel(
-          'room:${widget.roomId}',
+          widget.roomConversation
+              ? 'room:${widget.roomMode}:${widget.roomId}'
+              : 'room:${widget.roomId}',
           opts: const RealtimeChannelConfig(private: true),
         )
         .onBroadcast(
@@ -80,6 +166,15 @@ class _RoomChatPageState extends State<RoomChatPage> {
               }
             });
             _scrollToLatest();
+          },
+        )
+        .onBroadcast(
+          event: 'message_removed',
+          callback: (payload) {
+            if (payload['room_id']?.toString() != widget.roomId || !mounted) return;
+            final id = payload['message_id']?.toString();
+            if (id == null) return;
+            setState(() => _messages.removeWhere((message) => message.id == id));
           },
         )
         .subscribe((status, error) {
@@ -106,10 +201,19 @@ class _RoomChatPageState extends State<RoomChatPage> {
 
   Future<void> _loadHistory() async {
     try {
-      final rows = await _supabase.rpc(
-        'get_room_messages',
-        params: {'p_room_id': widget.roomId, 'p_limit': 100},
-      );
+      final rows = widget.roomConversation
+          ? await _supabase.rpc(
+              'get_room_chat_messages',
+              params: {
+                'p_room_id': widget.roomId,
+                'p_mode': widget.roomMode,
+                'p_limit': 100,
+              },
+            )
+          : await _supabase.rpc(
+              'get_room_messages',
+              params: {'p_room_id': widget.roomId, 'p_limit': 100},
+            );
       final history = List<Map<String, dynamic>>.from(rows)
           .map(
             (row) => _RoomMessage.fromMap(
@@ -156,10 +260,24 @@ class _RoomChatPageState extends State<RoomChatPage> {
 
     setState(() => _sending = true);
     try {
-      await _supabase.from('room_messages').insert({
-        'room_id': widget.roomId,
-        'content': content,
-      });
+      if (widget.roomConversation) {
+        await _supabase.rpc(
+          'send_room_chat_message',
+          params: {
+            'p_room_id': widget.roomId,
+            'p_mode': widget.roomMode,
+            'p_content': content,
+          },
+        );
+      } else {
+        await _supabase.from('room_messages').insert({
+          'room_id': widget.roomId,
+          'room_mode': widget.roomId == 'official-live'
+              ? 'official'
+              : 'unofficial',
+          'content': content,
+        });
+      }
       _textController.clear();
       await _loadHistory();
     } catch (_) {
@@ -171,6 +289,165 @@ class _RoomChatPageState extends State<RoomChatPage> {
     } finally {
       if (mounted) setState(() => _sending = false);
     }
+  }
+
+  Future<void> _deleteMessage(_RoomMessage message) async {
+    if (!_isSuperAdmin) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Remove this chat message?'),
+        content: const Text('This message will be deleted for everyone in this room.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Remove')),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await _supabase.rpc('admin_delete_room_message', params: {
+        'p_message_id': message.id,
+        'p_room_id': widget.roomId,
+        'p_mode': widget.roomId == 'official-live' ? 'official' : widget.roomMode,
+      });
+      if (mounted) setState(() => _messages.removeWhere((item) => item.id == message.id));
+    } catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not remove message: $error')));
+    }
+  }
+
+  Future<void> _blockUser(_RoomMessage message) async {
+    final authorId = message.authorId;
+    if (!_canModerateRoom || authorId == null || message.isMine) return;
+    final reason = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Remove and block this member?'),
+        content: TextField(
+          controller: reason,
+          maxLength: 500,
+          maxLines: 3,
+          decoration: const InputDecoration(
+            labelText: 'Reason for the warning',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Block for 3 days'),
+          ),
+        ],
+      ),
+    );
+    final messageReason = reason.text.trim();
+    reason.dispose();
+    if (confirmed != true || messageReason.isEmpty) return;
+    try {
+      await _supabase.rpc(
+        'block_room_user',
+        params: {
+          'p_room_id': widget.roomId,
+          'p_user_id': authorId,
+          'p_reason': messageReason,
+        },
+      );
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Member removed and blocked for 3 days.'),
+          ),
+        );
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not block this member: ' + error.toString()),
+          ),
+        );
+    }
+  }
+
+  Future<void> _showOfficialProfile(String? userId) async {
+    if (widget.roomId != 'official-live' || userId == null) return;
+    try {
+      final result = await _supabase.rpc(
+        'get_official_profile_card',
+        params: {'p_user_id': userId},
+      );
+      if (result is! List || result.isEmpty || !mounted) return;
+      final profile = Map<String, dynamic>.from(result.first);
+      final isFaculty = profile['role'] == 'faculty';
+      final isSuperAdmin = profile['role'] == 'super_admin';
+      await showModalBottomSheet<void>(
+        context: context,
+        builder: (context) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(22),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  profile['real_name']?.toString() ?? 'Student',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  isFaculty
+                      ? 'Faculty' +
+                            ((profile['branch_code']?.toString().isNotEmpty ??
+                                    false)
+                                ? ' · ' + profile['branch_code'].toString()
+                                : '')
+                      : isSuperAdmin
+                      ? 'Faculty · Super Admin'
+                      : (profile['branch_code']?.toString() ?? '') +
+                            ' · ' +
+                            _yearLabel(profile['study_year']),
+                ),
+                if ((profile['enrollment_number']?.toString().isNotEmpty ?? false)) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    'Enrollment number: ${profile['enrollment_number']}',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+                if (profile['moderated_rooms'] is List &&
+                    (profile['moderated_rooms'] as List).isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  const Text('Room moderator in'),
+                  const SizedBox(height: 4),
+                  Text((profile['moderated_rooms'] as List).join(', ')),
+                ],
+              ],
+            ),
+          ),
+        ),
+      );
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not open profile: ' + error.toString()),
+          ),
+        );
+    }
+  }
+
+  String _yearLabel(Object? value) {
+    final year = (value as num?)?.toInt();
+    if (year == null) return 'Year unavailable';
+    if (year > 4) return 'Alumni';
+    if (year == 1) return '1st year';
+    if (year == 2) return '2nd year';
+    if (year == 3) return '3rd year';
+    return '4th year';
   }
 
   void _scrollToLatest() {
@@ -190,6 +467,18 @@ class _RoomChatPageState extends State<RoomChatPage> {
     _scrollController.dispose();
     final channel = _channel;
     if (channel != null) unawaited(_supabase.removeChannel(channel));
+    if (_joinedRoomConversation) {
+      unawaited(
+        _supabase.rpc(
+          'leave_room_chat',
+          params: {'p_room_id': widget.roomId, 'p_mode': widget.roomMode},
+        ),
+      );
+    } else if (_joinedOfficialSession) {
+      unawaited(
+        _supabase.rpc('leave_room', params: {'p_room_id': widget.roomId}),
+      );
+    }
     super.dispose();
   }
 
@@ -223,11 +512,12 @@ class _RoomChatPageState extends State<RoomChatPage> {
                       ],
                     ),
                   ),
-                  IconButton(
-                    tooltip: 'Close live chat',
-                    onPressed: widget.onClose,
-                    icon: const Icon(Icons.close_rounded),
-                  ),
+                  if (widget.onClose != null)
+                    IconButton(
+                      tooltip: 'Close live chat',
+                      onPressed: widget.onClose,
+                      icon: const Icon(Icons.close_rounded),
+                    ),
                 ],
               ),
             ),
@@ -245,7 +535,11 @@ class _RoomChatPageState extends State<RoomChatPage> {
           children: [
             Text('${widget.roomName} chat'),
             Text(
-              _realtimeConnected ? 'Live' : 'Connecting…',
+              widget.roomConversation
+                  ? (_realtimeConnected
+                        ? 'Live · Messages disappear after 7 days'
+                        : 'Connecting · 7-day message history')
+                  : (_realtimeConnected ? 'Live' : 'Connecting…'),
               style: Theme.of(context).textTheme.labelSmall,
             ),
           ],
@@ -256,6 +550,20 @@ class _RoomChatPageState extends State<RoomChatPage> {
   }
 
   Widget _buildChatBody() {
+    if (_blockedReason != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            'You are blocked from ' +
+                widget.roomName +
+                ' for 3 days. Reason: ' +
+                _blockedReason!,
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
     return Column(
       children: [
         Expanded(child: _buildMessages()),
@@ -348,9 +656,32 @@ class _RoomChatPageState extends State<RoomChatPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 if (!mine)
-                  Text(
-                    message.authorUsername,
-                    style: Theme.of(context).textTheme.labelLarge,
+                  InkWell(
+                    onTap: widget.roomId == 'official-live'
+                        ? () => _showOfficialProfile(message.authorId)
+                        : null,
+                    onLongPress:
+                        widget.roomId == 'official-live' && _canModerateRoom
+                        ? () => _blockUser(message)
+                        : null,
+                    child: Text(
+                      message.authorUsername,
+                      style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        decoration: widget.roomId == 'official-live'
+                            ? TextDecoration.underline
+                            : null,
+                      ),
+                    ),
+                  ),
+                if (_isSuperAdmin)
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: PopupMenuButton<String>(
+                      tooltip: 'Admin actions',
+                      onSelected: (value) { if (value == 'remove') _deleteMessage(message); },
+                      itemBuilder: (_) => const [PopupMenuItem(value: 'remove', child: Text('Remove for everyone'))],
+                      child: const Icon(Icons.more_horiz, size: 20),
+                    ),
                   ),
                 Text(message.content),
                 const SizedBox(height: 4),
@@ -382,6 +713,7 @@ class _RoomMessage {
     required this.id,
     required this.roomId,
     required this.authorUsername,
+    required this.authorId,
     required this.content,
     required this.createdAt,
     required this.isMine,
@@ -397,6 +729,7 @@ class _RoomMessage {
       id: map['message_id'] as String,
       roomId: map['room_id'] as String,
       authorUsername: authorUsername,
+      authorId: map['author_id'] as String?,
       content: map['content'] as String,
       createdAt: DateTime.parse(map['created_at'] as String),
       isMine:
@@ -408,6 +741,7 @@ class _RoomMessage {
   final String id;
   final String roomId;
   final String authorUsername;
+  final String? authorId;
   final String content;
   final DateTime createdAt;
   final bool isMine;
