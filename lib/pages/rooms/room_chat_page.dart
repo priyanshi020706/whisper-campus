@@ -67,9 +67,17 @@ class _RoomChatPageState extends State<RoomChatPage> {
     final uid = _supabase.auth.currentUser?.id;
     if (uid == null) return;
     try {
-      final row = await _supabase.from('profiles').select('role').eq('id', uid).maybeSingle();
+      final row = await _supabase
+          .from('profiles')
+          .select('role')
+          .eq('id', uid)
+          .maybeSingle();
       final admin = row?['role'] == 'super_admin';
-      if (mounted) setState(() { _isSuperAdmin = admin; if (admin) _canModerateRoom = true; });
+      if (mounted)
+        setState(() {
+          _isSuperAdmin = admin;
+          if (admin) _canModerateRoom = true;
+        });
     } catch (_) {}
   }
 
@@ -82,10 +90,10 @@ class _RoomChatPageState extends State<RoomChatPage> {
       _joinedRoomConversation = true;
       widget.onRead?.call();
       if (mounted) _startChat();
-    } catch (_) {
+    } catch (error) {
       if (!mounted) return;
       setState(() {
-        _error = 'Could not join this room chat. Please try again.';
+        _error = 'Could not join this room chat: $error';
         _loading = false;
       });
     }
@@ -171,10 +179,13 @@ class _RoomChatPageState extends State<RoomChatPage> {
         .onBroadcast(
           event: 'message_removed',
           callback: (payload) {
-            if (payload['room_id']?.toString() != widget.roomId || !mounted) return;
+            if (payload['room_id']?.toString() != widget.roomId || !mounted)
+              return;
             final id = payload['message_id']?.toString();
             if (id == null) return;
-            setState(() => _messages.removeWhere((message) => message.id == id));
+            setState(
+              () => _messages.removeWhere((message) => message.id == id),
+            );
           },
         )
         .subscribe((status, error) {
@@ -239,11 +250,11 @@ class _RoomChatPageState extends State<RoomChatPage> {
         _error = null;
       });
       _scrollToLatest();
-    } catch (_) {
+    } catch (error) {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = 'Could not load messages. Please try again.';
+        _error = 'Could not load messages: $error';
       });
     }
   }
@@ -270,20 +281,17 @@ class _RoomChatPageState extends State<RoomChatPage> {
           },
         );
       } else {
-        await _supabase.from('room_messages').insert({
-          'room_id': widget.roomId,
-          'room_mode': widget.roomId == 'official-live'
-              ? 'official'
-              : 'unofficial',
-          'content': content,
-        });
+        await _supabase.rpc(
+          'send_campus_live_message',
+          params: {'p_room_id': widget.roomId, 'p_content': content},
+        );
       }
       _textController.clear();
       await _loadHistory();
-    } catch (_) {
+    } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not send your message.')),
+          SnackBar(content: Text('Could not send your message: $error')),
         );
       }
     } finally {
@@ -297,23 +305,40 @@ class _RoomChatPageState extends State<RoomChatPage> {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Remove this chat message?'),
-        content: const Text('This message will be deleted for everyone in this room.'),
+        content: const Text(
+          'This message will be deleted for everyone in this room.',
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Remove')),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Remove'),
+          ),
         ],
       ),
     );
     if (confirmed != true || !mounted) return;
     try {
-      await _supabase.rpc('admin_delete_room_message', params: {
-        'p_message_id': message.id,
-        'p_room_id': widget.roomId,
-        'p_mode': widget.roomId == 'official-live' ? 'official' : widget.roomMode,
-      });
-      if (mounted) setState(() => _messages.removeWhere((item) => item.id == message.id));
+      await _supabase.rpc(
+        'admin_delete_room_message',
+        params: {
+          'p_message_id': message.id,
+          'p_room_id': widget.roomId,
+          'p_mode': widget.roomId == 'official-live'
+              ? 'official'
+              : widget.roomMode,
+        },
+      );
+      if (mounted)
+        setState(() => _messages.removeWhere((item) => item.id == message.id));
     } catch (error) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not remove message: $error')));
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not remove message: $error')),
+        );
     }
   }
 
@@ -411,7 +436,8 @@ class _RoomChatPageState extends State<RoomChatPage> {
                             ' · ' +
                             _yearLabel(profile['study_year']),
                 ),
-                if ((profile['enrollment_number']?.toString().isNotEmpty ?? false)) ...[
+                if ((profile['enrollment_number']?.toString().isNotEmpty ??
+                    false)) ...[
                   const SizedBox(height: 6),
                   Text(
                     'Enrollment number: ${profile['enrollment_number']}',
@@ -678,8 +704,15 @@ class _RoomChatPageState extends State<RoomChatPage> {
                     alignment: Alignment.centerRight,
                     child: PopupMenuButton<String>(
                       tooltip: 'Admin actions',
-                      onSelected: (value) { if (value == 'remove') _deleteMessage(message); },
-                      itemBuilder: (_) => const [PopupMenuItem(value: 'remove', child: Text('Remove for everyone'))],
+                      onSelected: (value) {
+                        if (value == 'remove') _deleteMessage(message);
+                      },
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(
+                          value: 'remove',
+                          child: Text('Remove for everyone'),
+                        ),
+                      ],
                       child: const Icon(Icons.more_horiz, size: 20),
                     ),
                   ),
