@@ -24,7 +24,13 @@ class _SignUpPageState extends State<SignUpPage> {
     });
 
     try {
-      await _authService.signInWithGoogle();
+      final launched = await _authService.signInWithGoogle();
+      if (!mounted || launched) return;
+
+      setState(() {
+        _message = 'Could not open Google sign-in. Please try again.';
+        _loading = false;
+      });
     } on AuthException catch (e) {
       if (!mounted) return;
 

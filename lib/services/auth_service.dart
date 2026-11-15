@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AuthService {
@@ -10,11 +11,14 @@ class AuthService {
     );
   }
 
-  Future<void> signInWithGoogle() async {
-  await _supabase.auth.signInWithOAuth(
-    OAuthProvider.google,
-  );
-}
+  Future<bool> signInWithGoogle() {
+    return _supabase.auth.signInWithOAuth(
+      OAuthProvider.google,
+      // Send the OAuth callback to the app's actual local/dev URL instead of
+      // Supabase's default Site URL (which may point at a stopped server).
+      redirectTo: kIsWeb ? Uri.base.origin : null,
+    );
+  }
 
   Future<void> signOut() async {
     await _supabase.auth.signOut();
