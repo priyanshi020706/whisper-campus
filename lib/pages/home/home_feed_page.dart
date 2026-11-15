@@ -48,6 +48,7 @@ class HomeFeedPage extends StatefulWidget {
 
 class _HomeFeedPageState extends State<HomeFeedPage>
     with SingleTickerProviderStateMixin {
+  final _scaffoldKey = GlobalKey<ScaffoldState>();
   final _supabase = Supabase.instance.client;
   final _homeScrollController = ScrollController();
   List<_CampusRoom> _rooms = [];
@@ -157,8 +158,8 @@ class _HomeFeedPageState extends State<HomeFeedPage>
             _mode = widget.roomPage
                 ? _CampusMode.unofficial
                 : (isFaculty || isSuperAdmin)
-                    ? _CampusMode.official
-                    : _CampusMode.unofficial;
+                ? _CampusMode.official
+                : _CampusMode.unofficial;
             _identityLoaded = true;
             _identityError = row == null
                 ? 'Could not load your profile.'
@@ -237,11 +238,12 @@ class _HomeFeedPageState extends State<HomeFeedPage>
 
   Future<void> _checkRoomReviewAccess(String roomId) async {
     try {
-      final result = await _supabase.rpc('is_active_room_moderator', params: {
-        'p_room': roomId,
-        'p_mode': _mode.name,
-      });
-      if (mounted) setState(() => _canReviewRoomPosts = _isSuperAdmin || result == true);
+      final result = await _supabase.rpc(
+        'is_active_room_moderator',
+        params: {'p_room': roomId, 'p_mode': _mode.name},
+      );
+      if (mounted)
+        setState(() => _canReviewRoomPosts = _isSuperAdmin || result == true);
     } catch (_) {
       if (mounted) setState(() => _canReviewRoomPosts = _isSuperAdmin);
     }
@@ -250,26 +252,30 @@ class _HomeFeedPageState extends State<HomeFeedPage>
   Future<void> _openRoomPostReview() async {
     final roomId = _selectedRoomId;
     if (roomId == null) return;
-    await Navigator.of(context).push<void>(MaterialPageRoute<void>(
-      builder: (_) => RoomPostReviewPage(
-        roomId: roomId,
-        roomName: widget.initialRoomName ?? _selectedRoomName,
-        mode: _mode.name,
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => RoomPostReviewPage(
+          roomId: roomId,
+          roomName: widget.initialRoomName ?? _selectedRoomName,
+          mode: _mode.name,
+        ),
       ),
-    ));
+    );
     if (mounted) await _loadPosts(showLoading: false);
   }
 
   Future<void> _openModeratorContact() async {
     final roomId = _selectedRoomId;
     if (roomId == null) return;
-    await Navigator.of(context).push<void>(MaterialPageRoute<void>(
-      builder: (_) => RoomModeratorContactPage(
-        roomId: roomId,
-        roomName: widget.initialRoomName ?? _selectedRoomName,
-        mode: _mode.name,
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => RoomModeratorContactPage(
+          roomId: roomId,
+          roomName: widget.initialRoomName ?? _selectedRoomName,
+          mode: _mode.name,
+        ),
       ),
-    ));
+    );
   }
 
   Future<void> _changeMode(_CampusMode mode) async {
@@ -825,19 +831,30 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         var directPost = _isFaculty || _isSuperAdmin;
         if (!directPost) {
           try {
-            directPost = await _supabase.rpc('is_active_room_moderator', params: {
-              'p_room': modeAtOpen == _CampusMode.official ? officialRoomId : roomId,
-              'p_mode': modeAtOpen.name,
-            }) == true;
+            directPost =
+                await _supabase.rpc(
+                  'is_active_room_moderator',
+                  params: {
+                    'p_room': modeAtOpen == _CampusMode.official
+                        ? officialRoomId
+                        : roomId,
+                    'p_mode': modeAtOpen.name,
+                  },
+                ) ==
+                true;
           } catch (_) {}
         }
         if (mounted) {
           final isPending = !directPost;
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(isPending
-                ? 'Post submitted. It will appear after this room’s moderator approves it.'
-                : 'Post published.'),
-          ));
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                isPending
+                    ? 'Post submitted. It will appear after this room’s moderator approves it.'
+                    : 'Post published.',
+              ),
+            ),
+          );
         }
       }
     } catch (error) {
@@ -1005,24 +1022,41 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Delete this post?'),
-        content: const Text('This will permanently remove the post and its replies.'),
+        content: const Text(
+          'This will permanently remove the post and its replies.',
+        ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Delete')),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Delete'),
+          ),
         ],
       ),
     );
     if (confirmed != true || !mounted) return;
     try {
-      final path = await _supabase.rpc('admin_delete_post', params: {'p_post_id': post.id, 'p_mode': 'official'}) as String?;
+      final path = await _supabase.rpc(
+        'admin_delete_post',
+        params: {'p_post_id': post.id, 'p_mode': 'official'},
+      ) as String?;
       if (path != null) {
-        try { await _supabase.storage.from(_officialPostImageBucket).remove([path]); } catch (_) {}
+        try {
+          await _supabase.storage.from(_officialPostImageBucket).remove([path]);
+        } catch (_) {}
       }
       if (!mounted) return;
       setState(() => _officialPosts.removeWhere((item) => item.id == post.id));
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Post deleted.')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Post deleted.')));
     } catch (error) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not delete post: $error')));
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not delete post: $error')),
+        );
     }
   }
 
@@ -1108,7 +1142,9 @@ class _HomeFeedPageState extends State<HomeFeedPage>
 
   Future<void> _openFacultyModeratorPage() async {
     await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(builder: (_) => const FacultyModeratorPage()),
+      MaterialPageRoute<void>(
+        builder: (_) => FacultyModeratorPage(initialMode: _mode.name),
+      ),
     );
   }
 
@@ -1123,6 +1159,172 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       _livePanelOpen = !_livePanelOpen;
       if (!_livePanelOpen) _chatJoined = false;
     });
+  }
+
+  bool get _canManageModerators =>
+      _isSuperAdmin || (_mode == _CampusMode.official && _isFaculty);
+
+  void _goHome() {
+    if (widget.roomPage) {
+      Navigator.of(context).popUntil((route) => route.isFirst);
+    } else if (_livePanelOpen) {
+      _toggleLivePanel();
+    } else if (_homeScrollController.hasClients) {
+      _homeScrollController.animateTo(
+        0,
+        duration: const Duration(milliseconds: 280),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  List<Widget> _buildAppBarActions({required bool compact}) {
+    final compactButtonStyle = compact
+        ? IconButton.styleFrom(
+            minimumSize: const Size(40, 40),
+            padding: EdgeInsets.zero,
+            visualDensity: VisualDensity.compact,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          )
+        : null;
+    final home = IconButton(
+      tooltip: 'Home',
+      onPressed: _goHome,
+      icon: const Icon(Icons.home_outlined),
+      style: compactButtonStyle,
+    );
+    final live = CampusLiveAction(
+      active: _livePanelOpen,
+      onPressed: _toggleLivePanel,
+      compact: compact,
+    );
+    final moderators = _canManageModerators
+        ? IconButton(
+            tooltip: 'Manage room moderators',
+            onPressed: _openFacultyModeratorPage,
+            icon: const Icon(Icons.admin_panel_settings_outlined),
+            style: compactButtonStyle,
+          )
+        : null;
+    final profile = IconButton(
+      tooltip: 'My profile',
+      onPressed: _openProfile,
+      icon: _mode == _CampusMode.unofficial
+          ? StudentAvatar(seed: _myAvatarSeed, size: 32)
+          : const Icon(Icons.school_rounded),
+      style: compactButtonStyle,
+    );
+
+    if (compact) {
+      return [
+        home,
+        live,
+        if (moderators != null) moderators,
+        PopupMenuButton<String>(
+          tooltip: 'More options',
+          padding: EdgeInsets.zero,
+          iconSize: 24,
+          visualDensity: VisualDensity.compact,
+          onSelected: (action) {
+            switch (action) {
+              case 'inbox':
+                _openModeratorInbox();
+                break;
+              case 'rooms':
+                _scaffoldKey.currentState?.openDrawer();
+                break;
+              case 'review':
+                _openRoomPostReview();
+                break;
+              case 'contact':
+                _openModeratorContact();
+                break;
+              case 'theme':
+                AppThemeScope.of(context).toggle();
+                break;
+              case 'moderators':
+                _openFacultyModeratorPage();
+                break;
+            }
+          },
+          itemBuilder: (context) => [
+            if (_hasModeratorInbox)
+              const PopupMenuItem(
+                value: 'inbox',
+                child: Text('Moderator inbox'),
+              ),
+            if (widget.roomPage)
+              const PopupMenuItem(value: 'rooms', child: Text('Explore rooms')),
+            if (widget.roomPage && _canReviewRoomPosts)
+              const PopupMenuItem(
+                value: 'review',
+                child: Text('Review pending posts'),
+              ),
+            if (widget.roomPage)
+              const PopupMenuItem(
+                value: 'contact',
+                child: Text('Contact moderator'),
+              ),
+            if (widget.roomPage && moderators != null)
+              const PopupMenuItem(
+                value: 'moderators',
+                child: Text('Manage moderators'),
+              ),
+            PopupMenuItem(
+              value: 'theme',
+              child: Text(
+                Theme.of(context).brightness == Brightness.dark
+                    ? 'Switch to light theme'
+                    : 'Switch to dark theme',
+              ),
+            ),
+          ],
+        ),
+        profile,
+      ];
+    }
+
+    return [
+      home,
+      if (!widget.roomPage && _hasModeratorInbox)
+        IconButton(
+          tooltip: 'Moderator inbox',
+          onPressed: _openModeratorInbox,
+          icon: const Icon(Icons.inbox_outlined),
+        ),
+      if (widget.roomPage)
+        IconButton(
+          tooltip: 'Explore rooms',
+          onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+          icon: const Icon(Icons.menu_rounded),
+        ),
+      if (widget.roomPage && _canReviewRoomPosts)
+        IconButton(
+          tooltip: 'Review pending posts',
+          onPressed: _openRoomPostReview,
+          icon: const Icon(Icons.fact_check_outlined),
+        ),
+      if (widget.roomPage)
+        IconButton(
+          tooltip: 'Contact moderator',
+          onPressed: _openModeratorContact,
+          icon: const Icon(Icons.support_agent_outlined),
+        ),
+      live,
+      if (!widget.roomPage && moderators != null) moderators,
+      IconButton(
+        tooltip: Theme.of(context).brightness == Brightness.dark
+            ? 'Switch to light theme'
+            : 'Switch to dark theme',
+        onPressed: AppThemeScope.of(context).toggle,
+        icon: Icon(
+          Theme.of(context).brightness == Brightness.dark
+              ? Icons.light_mode_outlined
+              : Icons.dark_mode_outlined,
+        ),
+      ),
+      profile,
+    ];
   }
 
   @override
@@ -1140,7 +1342,9 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         ),
       );
     }
+    final compactToolbar = MediaQuery.sizeOf(context).width < 560;
     return Scaffold(
+      key: _scaffoldKey,
       appBar: AppBar(
         leading: widget.roomPage
             ? IconButton(
@@ -1149,85 +1353,23 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                 icon: const Icon(Icons.arrow_back_rounded),
               )
             : null,
+        leadingWidth: compactToolbar ? 48 : null,
+        titleSpacing: compactToolbar ? 4 : null,
         title: widget.roomPage
             ? Text(widget.initialRoomName ?? 'Room')
             : WhisperBrand(
-                iconSize: 32,
-                wordmarkSize: 17,
+                centered: true,
+                iconSize: compactToolbar ? 24 : 32,
+                wordmarkSize: compactToolbar
+                    ? MediaQuery.sizeOf(context).width < 400
+                          ? 0
+                          : 12
+                    : 17,
                 foregroundColor: Theme.of(context).colorScheme.onSurface,
                 accentColor: Theme.of(context).colorScheme.primary,
                 bubbleInteriorColor: Theme.of(context).colorScheme.surface,
               ),
-        actions: [
-          IconButton(
-            tooltip: 'Home',
-            onPressed: () {
-              if (widget.roomPage) {
-                Navigator.of(context).popUntil((route) => route.isFirst);
-              } else if (_livePanelOpen) {
-                _toggleLivePanel();
-              } else if (_homeScrollController.hasClients) {
-                _homeScrollController.animateTo(
-                  0,
-                  duration: const Duration(milliseconds: 280),
-                  curve: Curves.easeOut,
-                );
-              }
-            },
-            icon: const Icon(Icons.home_outlined),
-          ),
-          if (!widget.roomPage && _hasModeratorInbox)
-            IconButton(
-              tooltip: 'Moderator inbox',
-              onPressed: _openModeratorInbox,
-              icon: const Icon(Icons.inbox_outlined),
-            ),
-          if (widget.roomPage)
-            Builder(
-              builder: (context) => IconButton(
-                tooltip: 'Explore rooms',
-                onPressed: () => Scaffold.of(context).openDrawer(),
-                icon: const Icon(Icons.menu_rounded),
-              ),
-            ),
-          if (widget.roomPage && _canReviewRoomPosts)
-            IconButton(
-              tooltip: 'Review pending posts',
-              onPressed: _openRoomPostReview,
-              icon: const Icon(Icons.fact_check_outlined),
-            ),
-          if (widget.roomPage)
-            IconButton(
-              tooltip: 'Contact moderator',
-              onPressed: _openModeratorContact,
-              icon: const Icon(Icons.support_agent_outlined),
-            ),
-          CampusLiveAction(active: _livePanelOpen, onPressed: _toggleLivePanel),
-          if (!widget.roomPage && _mode == _CampusMode.official && (_isFaculty || _isSuperAdmin))
-            IconButton(
-              tooltip: 'Manage room moderators',
-              onPressed: _openFacultyModeratorPage,
-              icon: const Icon(Icons.admin_panel_settings_outlined),
-            ),
-          IconButton(
-            tooltip: Theme.of(context).brightness == Brightness.dark
-                ? 'Switch to light theme'
-                : 'Switch to dark theme',
-            onPressed: AppThemeScope.of(context).toggle,
-            icon: Icon(
-              Theme.of(context).brightness == Brightness.dark
-                  ? Icons.light_mode_outlined
-                  : Icons.dark_mode_outlined,
-            ),
-          ),
-          IconButton(
-            tooltip: 'My profile',
-            onPressed: _openProfile,
-            icon: _mode == _CampusMode.unofficial
-                ? StudentAvatar(seed: _myAvatarSeed, size: 32)
-                : const Icon(Icons.school_rounded),
-          ),
-        ],
+        actions: _buildAppBarActions(compact: compactToolbar),
       ),
       onDrawerChanged: (isOpen) {
         if (mounted) setState(() => _drawerOpen = isOpen);
@@ -1757,7 +1899,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
             ),
           ),
         ),
-        if (_isFaculty || _isSuperAdmin) ...[
+        if (_mode == _CampusMode.official && (_isFaculty || _isSuperAdmin)) ...[
           const SizedBox(height: 12),
           Card(
             child: Padding(
@@ -2296,7 +2438,12 @@ class _OfficialPost {
 }
 
 class _OfficialPostCard extends StatelessWidget {
-  const _OfficialPostCard({required this.post, required this.onTap, this.canAdminDelete = false, this.onAdminDelete});
+  const _OfficialPostCard({
+    required this.post,
+    required this.onTap,
+    this.canAdminDelete = false,
+    this.onAdminDelete,
+  });
 
   final _OfficialPost post;
   final VoidCallback onTap;
@@ -2371,8 +2518,15 @@ class _OfficialPostCard extends StatelessWidget {
                     if (canAdminDelete && onAdminDelete != null)
                       PopupMenuButton<String>(
                         tooltip: 'Post options',
-                        onSelected: (value) { if (value == 'delete') onAdminDelete?.call(); },
-                        itemBuilder: (_) => const [PopupMenuItem(value: 'delete', child: Text('Delete post'))],
+                        onSelected: (value) {
+                          if (value == 'delete') onAdminDelete?.call();
+                        },
+                        itemBuilder: (_) => const [
+                          PopupMenuItem(
+                            value: 'delete',
+                            child: Text('Delete post'),
+                          ),
+                        ],
                       ),
                     Text(
                       _dateLabel(),
@@ -2520,36 +2674,41 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
   Future<void> _loadReviewAccess() async {
     final roomId = 'dept-' + widget.department.code;
     try {
-      final moderator = await _supabase.rpc('is_active_room_moderator', params: {
-        'p_room': roomId,
-        'p_mode': 'official',
-      });
+      final moderator = await _supabase.rpc(
+        'is_active_room_moderator',
+        params: {'p_room': roomId, 'p_mode': 'official'},
+      );
       final admin = await _supabase.rpc('is_super_admin');
-      if (mounted) setState(() => _canReviewPosts = moderator == true || admin == true);
+      if (mounted)
+        setState(() => _canReviewPosts = moderator == true || admin == true);
     } catch (_) {
       // Keep regular room browsing available if the optional review check fails.
     }
   }
 
   Future<void> _openReviewQueue() async {
-    await Navigator.of(context).push<void>(MaterialPageRoute<void>(
-      builder: (_) => RoomPostReviewPage(
-        roomId: 'dept-' + widget.department.code,
-        roomName: widget.department.name,
-        mode: 'official',
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => RoomPostReviewPage(
+          roomId: 'dept-' + widget.department.code,
+          roomName: widget.department.name,
+          mode: 'official',
+        ),
       ),
-    ));
+    );
     if (mounted) await _loadPosts();
   }
 
   Future<void> _openModeratorContact() async {
-    await Navigator.of(context).push<void>(MaterialPageRoute<void>(
-      builder: (_) => RoomModeratorContactPage(
-        roomId: 'dept-' + widget.department.code,
-        roomName: widget.department.name,
-        mode: 'official',
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => RoomModeratorContactPage(
+          roomId: 'dept-' + widget.department.code,
+          roomName: widget.department.name,
+          mode: 'official',
+        ),
       ),
-    ));
+    );
   }
 
   void _handleTabChanged() {

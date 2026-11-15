@@ -5,10 +5,12 @@ class CampusLiveAction extends StatefulWidget {
     super.key,
     required this.active,
     required this.onPressed,
+    this.compact = false,
   });
 
   final bool active;
   final VoidCallback onPressed;
+  final bool compact;
 
   @override
   State<CampusLiveAction> createState() => _CampusLiveActionState();
@@ -34,6 +36,14 @@ class _CampusLiveActionState extends State<CampusLiveAction>
       tooltip: widget.active ? 'Close Campus Live' : 'Campus Live',
       onPressed: widget.onPressed,
       color: widget.active ? colorScheme.primary : null,
+      style: widget.compact
+          ? IconButton.styleFrom(
+              minimumSize: const Size(40, 40),
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            )
+          : null,
       icon: Stack(
         clipBehavior: Clip.none,
         children: [
