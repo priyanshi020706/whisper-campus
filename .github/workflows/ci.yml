@@ -11,9 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same Flutter version as vercel.json, so CI and the deployed build agree.
+      # Newer Flutter releases deprecate package:flutter/material.dart, which
+      # would fail `flutter analyze` on every file until the app is migrated.
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          flutter-version: '3.47.4'
           cache: true
 
       - run: flutter pub get
