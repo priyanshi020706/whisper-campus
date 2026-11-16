@@ -129,16 +129,21 @@ class _ProfilePostDetailPageState extends State<ProfilePostDetailPage> {
     if (content.isEmpty || _sending) return;
     setState(() => _sending = true);
     try {
-      await _supabase
-          .from(widget.officialMode ? 'official_post_replies' : 'post_replies')
-          .insert({'post_id': widget.activity.postId, 'content': content});
+      await _supabase.rpc(
+        'submit_post_reply',
+        params: {
+          'p_post_id': widget.activity.postId,
+          'p_content': content,
+          'p_mode': widget.officialMode ? 'official' : 'unofficial',
+        },
+      );
       _replyController.clear();
       await _loadReplies();
       if (mounted) setState(() => _commentCount++);
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not send your comment.')),
+          SnackBar(content: Text('Could not send your comment: $error')),
         );
       }
       debugPrint('PROFILE POST REPLY ERROR: $error');
@@ -338,7 +343,8 @@ class _PostContextCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
-    final postDisplayText = PostContent.decode(activity.postContent).displayText;
+    final postDisplayText = PostContent.decode(activity.postContent)
+        .displayText;
     return Card(
       clipBehavior: Clip.antiAlias,
       child: Padding(
@@ -462,7 +468,11 @@ class _YourCommentCard extends StatelessWidget {
             Row(
               children: [
                 officialMode
-                    ? Icon(Icons.mode_comment_outlined, size: 18, color: colors.primary)
+                    ? Icon(
+                        Icons.mode_comment_outlined,
+                        size: 18,
+                        color: colors.primary,
+                      )
                     : StudentAvatar(seed: avatarSeed, size: 28),
                 const SizedBox(width: 8),
                 Text(

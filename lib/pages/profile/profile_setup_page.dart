@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../home/home_feed_page.dart';
-import '../../services/college_profile_sync.dart';
 import '../../models/campus_department.dart';
 
 class ProfileSetupPage extends StatefulWidget {
@@ -73,9 +72,6 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
         );
       }
 
-      // Retry after setup in case the profile row was created after sign-in.
-      await syncCollegeProfileDetails(supabase: _supabase);
-
       if (!mounted) return;
 
       Navigator.of(context).pushReplacement(
@@ -85,7 +81,12 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
       if (!mounted) return;
 
       setState(() {
-        _error = 'Could not save profile. Please try again.';
+        _error = switch (e) {
+          PostgrestException(:final message, :final code) =>
+            'Profile save failed${code == null ? '' : ' ($code)'}: $message',
+          AuthException(:final message) => 'Sign-in issue: $message',
+          _ => 'Could not save profile (${e.runtimeType}). Please try again.',
+        };
       });
 
       debugPrint('PROFILE SETUP ERROR: $e');
@@ -100,7 +101,11 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.isFaculty ? 'Set Up Your Faculty Profile' : 'Set Up Your Profile'),
+        title: Text(
+          widget.isFaculty
+              ? 'Set Up Your Faculty Profile'
+              : 'Set Up Your Profile',
+        ),
       ),
       body: Center(
         child: SingleChildScrollView(
@@ -165,7 +170,9 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
                     ...campusDepartments.map(
                       (department) => DropdownMenuItem<String?>(
                         value: department.code,
-                        child: Text('${department.name} (${department.code.toUpperCase()})'),
+                        child: Text(
+                          '${department.name} (${department.code.toUpperCase()})',
+                        ),
                       ),
                     ),
                   ],
