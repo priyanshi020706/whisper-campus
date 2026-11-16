@@ -2,10 +2,20 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
 import '../../core/utils/error_message.dart';
+import '../../core/widgets/keyboard_helpers.dart';
 import '../../models/room_message.dart';
+import '../../services/room_activity_controller.dart';
 import '../../services/live_signals.dart';
 import 'chat_bubble.dart';
+import 'chat_parts.dart';
+import 'room_mute_button.dart';
+import '../../services/chat_extras_service.dart';
+import '../../models/poll.dart';
+import '../../models/chat_extras.dart';
+import '../../core/widgets/poll_card.dart';
+import '../../core/widgets/create_poll_sheet.dart';
 import '../../services/report_service.dart';
 
 class RoomChatPage extends StatefulWidget {
@@ -18,6 +28,7 @@ class RoomChatPage extends StatefulWidget {
     this.roomConversation = false,
     this.roomMode = 'unofficial',
     this.onRead,
+    this.activity,
   });
 
   final String roomId;
@@ -28,6 +39,10 @@ class RoomChatPage extends StatefulWidget {
   final String roomMode;
   final VoidCallback? onRead;
 
+  /// Shared recent-chat state. When given (room conversations), the header
+  /// shows a mute button for this room.
+  final RoomActivityController? activity;
+
   @override
   State<RoomChatPage> createState() => _RoomChatPageState();
 }
@@ -36,7 +51,21 @@ class _RoomChatPageState extends State<RoomChatPage> {
   final _supabase = Supabase.instance.client;
   final _textController = TextEditingController();
   final _scrollController = ScrollController();
+  final _inputFocus = FocusNode();
+  late final KeyboardStickyScroll _keyboardScroll;
   final List<RoomMessage> _messages = [];
+  final _extrasService = ChatExtrasService();
+
+  // Replies, reactions and polls, keyed by message id.
+  final Map<String, ReplyLink> _replyLinks = {};
+  final Map<String, List<ReactionCount>> _reactions = {};
+  final Map<String, PollData> _polls = {};
+  final Set<String> _extrasFetched = {};
+  RoomMessage? _replyingTo;
+
+  /// After a failed extras fetch (for example before the database update is
+  /// applied) stop retrying on every refresh for a minute.
+  DateTime? _extrasBackoffUntil;
   RealtimeChannel? _channel;
   Timer? _syncTimer;
   int _syncTick = 0;
@@ -55,6 +84,9 @@ class _RoomChatPageState extends State<RoomChatPage> {
   @override
   void initState() {
     super.initState();
+    // Keep the newest messages visible when the keyboard opens or closes.
+    _keyboardScroll = KeyboardStickyScroll(_scrollController)..attach();
+    _inputFocus.addListener(_onInputFocusChanged);
     if (widget.roomConversation) {
       _joinRoomConversation();
     } else if (widget.roomId == 'official-live' || widget.roomId == 'general') {
@@ -62,6 +94,23 @@ class _RoomChatPageState extends State<RoomChatPage> {
     } else {
       unawaited(_startChat());
     }
+  }
+
+  /// Bell button to mute this room for a while, or until unmuted.
+  Widget? _muteButton() {
+    final activity = widget.activity;
+    if (activity == null || !widget.roomConversation) return null;
+    return RoomMuteButton(controller: activity, roomId: widget.roomId);
+  }
+
+  void _onInputFocusChanged() {
+    // Tapping the box opens the keyboard: stay on the latest message if we
+    // were reading it. The metrics observer covers the animation itself; this
+    // covers keyboards that report their size late.
+    if (!_inputFocus.hasFocus || !_nearBottom) return;
+    Future<void>.delayed(const Duration(milliseconds: 350), () {
+      if (mounted && _nearBottom) _keyboardScroll.jumpToBottomAfterLayout();
+    });
   }
 
   Future<void> _startChat() async {
@@ -85,6 +134,10 @@ class _RoomChatPageState extends State<RoomChatPage> {
       _syncTick++;
       if (_realtimeConnected && _syncTick % 6 != 0) return;
       _loadHistory();
+      // Reactions and votes can be missed too: refresh them on the slow tick.
+      if (_syncTick % 6 == 0) {
+        unawaited(_loadExtras(all: true));
+      }
     });
   }
 
@@ -122,7 +175,8 @@ class _RoomChatPageState extends State<RoomChatPage> {
       if (blocked is List && blocked.isNotEmpty) {
         if (!mounted) return;
         setState(() {
-          _blockedReason = blocked.first['reason'] as String? ?? 'Room rules violation';
+          _blockedReason =
+              blocked.first['reason'] as String? ?? 'Room rules violation';
           _loading = false;
         });
         return;
@@ -167,9 +221,12 @@ class _RoomChatPageState extends State<RoomChatPage> {
         params: {'p_room': widget.roomId, 'p_mode': mode},
       );
       if (mounted) {
-        setState(() => _canModerateRoom =
-            _isSuperAdmin || moderator == true ||
-            (widget.roomId == 'official-live' && faculty == true));
+        setState(
+          () => _canModerateRoom =
+              _isSuperAdmin ||
+              moderator == true ||
+              (widget.roomId == 'official-live' && faculty == true),
+        );
       }
       if (mounted) unawaited(_startChat());
     } catch (error) {
@@ -224,11 +281,26 @@ class _RoomChatPageState extends State<RoomChatPage> {
                 }
               });
               if (stickToBottom) _scrollToLatest();
+              unawaited(_loadExtras(ids: [message.id]));
             } catch (error) {
               // Never lose a message because one payload was malformed.
               debugPrint('LIVE CHAT PAYLOAD ERROR: $error');
               _loadHistory();
             }
+          },
+        )
+        .onBroadcast(
+          event: 'reaction_changed',
+          callback: (raw) {
+            final id = unwrapBroadcast(raw)['message_id']?.toString();
+            if (id != null && mounted) unawaited(_loadExtras(ids: [id]));
+          },
+        )
+        .onBroadcast(
+          event: 'poll_changed',
+          callback: (raw) {
+            final id = unwrapBroadcast(raw)['message_id']?.toString();
+            if (id != null && mounted) unawaited(_loadExtras(ids: [id]));
           },
         )
         .onBroadcast(
@@ -309,9 +381,11 @@ class _RoomChatPageState extends State<RoomChatPage> {
         _loading = false;
         _error = null;
       });
-      if (_messages.length != hadMessages && (hadMessages == 0 || wasNearBottom)) {
+      if (_messages.length != hadMessages &&
+          (hadMessages == 0 || wasNearBottom)) {
         _scrollToLatest();
       }
+      unawaited(_loadExtras());
     } catch (error) {
       debugPrint('LOAD CHAT HISTORY ERROR: $error');
       if (!mounted) return;
@@ -322,6 +396,181 @@ class _RoomChatPageState extends State<RoomChatPage> {
         _error = 'Could not load messages: ${friendlyError(error)}';
       });
     }
+  }
+
+  /// Fetches replies, reactions and polls. By default only for messages not
+  /// fetched before; [ids] refreshes specific ones, [all] refreshes every
+  /// message currently shown.
+  Future<void> _loadExtras({List<String>? ids, bool all = false}) async {
+    final backingOff =
+        _extrasBackoffUntil != null &&
+        DateTime.now().isBefore(_extrasBackoffUntil!);
+    if (backingOff && !all && ids == null) return;
+    final wanted =
+        ids ??
+        [
+          for (final message in _messages)
+            if (all || !_extrasFetched.contains(message.id)) message.id,
+        ];
+    if (wanted.isEmpty) return;
+    // The server accepts up to 300 at a time; the screen holds at most ~100.
+    final batch = wanted.length > 200
+        ? wanted.sublist(wanted.length - 200)
+        : wanted;
+    try {
+      final extras = await _extrasService.fetch(batch);
+      if (!mounted) return;
+      setState(() {
+        for (final id in batch) {
+          _extrasFetched.add(id);
+          final link = extras.links[id];
+          if (link != null) {
+            _replyLinks[id] = link;
+          }
+          final poll = extras.polls[id];
+          if (poll != null) {
+            _polls[id] = poll;
+          }
+          final reactions = extras.reactions[id];
+          if (reactions == null || reactions.isEmpty) {
+            _reactions.remove(id);
+          } else {
+            _reactions[id] = reactions;
+          }
+        }
+      });
+    } catch (error) {
+      // Extras are an extra: messages stay readable without them.
+      debugPrint('CHAT EXTRAS ERROR: $error');
+      _extrasBackoffUntil = DateTime.now().add(const Duration(minutes: 1));
+    }
+  }
+
+  void _say(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  /// React to a message. Shows at once; undone if the server refuses.
+  Future<void> _react(RoomMessage message, String? emoji) async {
+    final before = _reactions[message.id] ?? const <ReactionCount>[];
+    final after = reactionsAfterChoosing(before, emoji);
+    setState(() {
+      if (after.isEmpty) {
+        _reactions.remove(message.id);
+      } else {
+        _reactions[message.id] = after;
+      }
+    });
+    try {
+      await _extrasService.react(message.id, emoji);
+    } catch (error) {
+      debugPrint('REACT ERROR: $error');
+      if (!mounted) return;
+      setState(() {
+        if (before.isEmpty) {
+          _reactions.remove(message.id);
+        } else {
+          _reactions[message.id] = before;
+        }
+      });
+      _say(friendlyError(error));
+    }
+  }
+
+  /// Sends a vote. Returns null on success, or a message to show.
+  Future<String?> _vote(
+    PollData poll,
+    List<String> optionIds,
+    String messageId,
+  ) async {
+    try {
+      await _extrasService.vote(poll.pollId, optionIds);
+      unawaited(_loadExtras(ids: [messageId]));
+      return null;
+    } catch (error) {
+      debugPrint('VOTE ERROR: $error');
+      return friendlyError(error);
+    }
+  }
+
+  Future<void> _createPoll() async {
+    final draft = await showCreatePollSheet(
+      context,
+      title: 'Create a poll',
+      confirmLabel: 'Send poll',
+    );
+    if (draft == null || !mounted) return;
+    try {
+      await _extrasService.createPoll(
+        roomId: widget.roomId,
+        mode: widget.roomMode,
+        draft: draft,
+      );
+      _keyboardScroll.stickToBottom();
+      await _loadHistory();
+      _scrollToLatest();
+    } catch (error) {
+      debugPrint('CREATE POLL ERROR: $error');
+      _say('Could not send the poll: ${friendlyError(error)}');
+    }
+  }
+
+  void _startReply(RoomMessage message) {
+    setState(() => _replyingTo = message);
+    _inputFocus.requestFocus();
+  }
+
+  void _openMessageActions(RoomMessage message) {
+    final mine = message.isMine;
+    final myReaction = (_reactions[message.id] ?? const <ReactionCount>[])
+        .where((r) => r.mine)
+        .map((r) => r.emoji)
+        .firstOrNull;
+    showMessageActions(
+      context,
+      currentReaction: myReaction,
+      onReact: (emoji) => _react(message, emoji),
+      actions: [
+        MessageAction(Icons.reply_rounded, 'Reply', () => _startReply(message)),
+        if (!mine)
+          MessageAction(Icons.flag_outlined, 'Report message', () {
+            reportContent(
+              context,
+              target: ReportTarget.message,
+              targetId: message.id,
+            );
+          }),
+        if (_isSuperAdmin)
+          MessageAction(
+            Icons.delete_outline,
+            'Remove for everyone',
+            () => _deleteMessage(message),
+          ),
+      ],
+    );
+  }
+
+  /// The quote shown in a reply bubble: the original if it is loaded, otherwise
+  /// the short text the server kept.
+  ChatQuote? _quoteFor(RoomMessage message) {
+    final link = _replyLinks[message.id];
+    if (link == null) return null;
+    RoomMessage? original;
+    for (final candidate in _messages) {
+      if (candidate.id == link.replyTo) {
+        original = candidate;
+        break;
+      }
+    }
+    return ChatQuote(
+      author: original == null
+          ? null
+          : (original.isMine ? 'You' : original.authorUsername),
+      content: original?.content ?? link.quotedContent ?? 'Original message',
+    );
   }
 
   Future<void> _sendMessage() async {
@@ -336,7 +585,16 @@ class _RoomChatPageState extends State<RoomChatPage> {
 
     setState(() => _sending = true);
     try {
-      if (widget.roomConversation) {
+      final replyTo = _replyingTo;
+      if (replyTo != null) {
+        await _extrasService.sendReply(
+          roomId: widget.roomId,
+          mode: widget.roomMode,
+          content: content,
+          replyTo: replyTo.id,
+        );
+        if (mounted) setState(() => _replyingTo = null);
+      } else if (widget.roomConversation) {
         await _supabase.rpc(
           'send_room_chat_message',
           params: {
@@ -352,12 +610,17 @@ class _RoomChatPageState extends State<RoomChatPage> {
         );
       }
       _textController.clear();
+      _keyboardScroll.stickToBottom();
       await _loadHistory();
       _scrollToLatest();
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not send your message: ${friendlyError(error)}')),
+          SnackBar(
+            content: Text(
+              'Could not send your message: ${friendlyError(error)}',
+            ),
+          ),
         );
       }
     } finally {
@@ -404,7 +667,9 @@ class _RoomChatPageState extends State<RoomChatPage> {
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not remove message: ${friendlyError(error)}')),
+          SnackBar(
+            content: Text('Could not remove message: ${friendlyError(error)}'),
+          ),
         );
       }
     }
@@ -466,7 +731,9 @@ class _RoomChatPageState extends State<RoomChatPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Could not block this member: ${friendlyError(error)}'),
+            content: Text(
+              'Could not block this member: ${friendlyError(error)}',
+            ),
           ),
         );
       }
@@ -500,10 +767,7 @@ class _RoomChatPageState extends State<RoomChatPage> {
                 const SizedBox(height: 8),
                 Text(
                   isFaculty
-                      ? 'Faculty${(profile['branch_code']?.toString().isNotEmpty ??
-                                    false)
-                                ? ' · ${profile['branch_code']}'
-                                : ''}'
+                      ? 'Faculty${(profile['branch_code']?.toString().isNotEmpty ?? false) ? ' · ${profile['branch_code']}' : ''}'
                       : isSuperAdmin
                       ? 'Faculty · Super Admin'
                       : '${profile['branch_code']?.toString() ?? ''} · ${_yearLabel(profile['study_year'])}',
@@ -563,6 +827,9 @@ class _RoomChatPageState extends State<RoomChatPage> {
   @override
   void dispose() {
     _syncTimer?.cancel();
+    _keyboardScroll.dispose();
+    _inputFocus.removeListener(_onInputFocusChanged);
+    _inputFocus.dispose();
     _textController.dispose();
     _scrollController.dispose();
     final channel = _channel;
@@ -612,6 +879,7 @@ class _RoomChatPageState extends State<RoomChatPage> {
                       ],
                     ),
                   ),
+                  ?_muteButton(),
                   if (widget.onClose != null)
                     IconButton(
                       tooltip: 'Close live chat',
@@ -644,6 +912,7 @@ class _RoomChatPageState extends State<RoomChatPage> {
             ),
           ],
         ),
+        actions: [?_muteButton()],
       ),
       body: _buildChatBody(),
     );
@@ -661,26 +930,42 @@ class _RoomChatPageState extends State<RoomChatPage> {
         ),
       );
     }
+    final replying = _replyingTo;
     return Column(
       children: [
         Expanded(child: _buildMessages()),
+        if (replying != null)
+          ReplyBanner(
+            author: replying.isMine ? 'yourself' : replying.authorUsername,
+            content: replying.content,
+            onClose: () => setState(() => _replyingTo = null),
+          ),
         SafeArea(
           top: false,
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+            padding: const EdgeInsets.fromLTRB(4, 8, 12, 12),
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
+                IconButton(
+                  tooltip: 'Create a poll',
+                  onPressed: _createPoll,
+                  icon: const Icon(Icons.poll_outlined),
+                ),
                 Expanded(
-                  child: TextField(
+                  child: SendOnEnter(
                     controller: _textController,
-                    minLines: 1,
-                    maxLines: 4,
-                    textCapitalization: TextCapitalization.sentences,
-                    onSubmitted: (_) => _sendMessage(),
-                    decoration: const InputDecoration(
-                      hintText: 'Write a message…',
-                      border: OutlineInputBorder(),
+                    onSend: _sendMessage,
+                    child: TextField(
+                      controller: _textController,
+                      focusNode: _inputFocus,
+                      minLines: 1,
+                      maxLines: 4,
+                      textCapitalization: TextCapitalization.sentences,
+                      decoration: const InputDecoration(
+                        hintText: 'Write a message…',
+                        border: OutlineInputBorder(),
+                      ),
                     ),
                   ),
                 ),
@@ -723,6 +1008,7 @@ class _RoomChatPageState extends State<RoomChatPage> {
     }
     return ListView.builder(
       controller: _scrollController,
+      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
       itemCount: _messages.length,
       itemBuilder: (context, index) {
@@ -730,16 +1016,19 @@ class _RoomChatPageState extends State<RoomChatPage> {
         final previous = index > 0 ? _messages[index - 1] : null;
         final mine = message.isMine;
         final startsGroup = startsChatGroup(previous, message);
-        final newDay = previous == null ||
+        final newDay =
+            previous == null ||
             !isSameChatDay(
               previous.createdAt.toLocal(),
               message.createdAt.toLocal(),
             );
 
         final menuItems = <(String, String)>[
+          if (!mine) ('reply', 'Reply'),
           if (!mine) ('report', 'Report message'),
           if (_isSuperAdmin) ('remove', 'Remove for everyone'),
         ];
+        final poll = _polls[message.id];
         final canOpenProfile = widget.roomId == 'official-live';
 
         return Column(
@@ -754,7 +1043,21 @@ class _RoomChatPageState extends State<RoomChatPage> {
               startsGroup: startsGroup,
               timeLabel: _formatTime(message.createdAt),
               menuItems: menuItems,
+              quote: _quoteFor(message),
+              reactions: _reactions[message.id] ?? const [],
+              onReactionTap: (emoji) => _react(message, emoji),
+              onActions: () => _openMessageActions(message),
+              onSwipeReply: () => _startReply(message),
+              pollBuilder: poll == null
+                  ? null
+                  : (textColor, accent) => PollCard(
+                      poll: poll,
+                      textColor: textColor,
+                      accentColor: accent,
+                      onVote: (ids) => _vote(poll, ids, message.id),
+                    ),
               onMenuSelected: (value) {
+                if (value == 'reply') _startReply(message);
                 if (value == 'remove') _deleteMessage(message);
                 if (value == 'report') {
                   reportContent(

@@ -26,7 +26,31 @@ import 'post_media_frame.dart';
 import '../../core/utils/error_message.dart';
 import '../../services/report_service.dart';
 import '../rooms/report_queue_page.dart';
+import '../../core/widgets/keyboard_helpers.dart';
 import '../../services/live_signals.dart';
+import '../settings/push_settings_card.dart';
+import '../../services/push/push_controller.dart';
+import '../search/search_page.dart';
+import '../events/events_page.dart';
+import '../events/announcements_page.dart';
+import '../../services/campus_updates_controller.dart';
+import '../../models/campus_updates.dart';
+
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../../models/poll.dart';
+import '../../core/widgets/poll_card.dart';
+import '../../core/widgets/create_poll_sheet.dart';
+import '../settings/notification_settings_page.dart';
+import '../saved/saved_posts_page.dart';
+import '../../services/saved_posts_controller.dart';
+import '../../services/post_edit_flow.dart';
+import '../../services/notification_prefs_controller.dart';
+import '../../models/post_card.dart';
+import '../../core/widgets/edit_dialogs.dart';
+import '../../services/room_activity_controller.dart';
+import '../../models/room_activity.dart';
+import '../../core/widgets/room_activity_widgets.dart';
 
 /// Signed image URLs last an hour. They are reused across live refreshes while
 /// younger than this, then signed again.
@@ -44,11 +68,20 @@ class HomeFeedPage extends StatefulWidget {
     this.initialRoomId,
     this.initialRoomName,
     this.roomPage = false,
+    this.roomActivity,
+    this.campusUpdates,
   });
 
   final String? initialRoomId;
   final String? initialRoomName;
   final bool roomPage;
+
+  /// Recent-chat and pin state shared with the screen that opened this room, so
+  /// every room list agrees. When null this page loads its own.
+  final RoomActivityController? roomActivity;
+
+  /// Events and announcements shared with the screen that opened this one.
+  final CampusUpdatesController? campusUpdates;
 
   @override
   State<HomeFeedPage> createState() => _HomeFeedPageState();
@@ -58,6 +91,22 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     with SingleTickerProviderStateMixin {
   final _scaffoldKey = GlobalKey<ScaffoldState>();
   final _supabase = Supabase.instance.client;
+  late final RoomActivityController _roomActivity;
+  late final bool _ownsRoomActivity;
+  final _saved = SavedPostsController();
+  late final CampusUpdatesController _campusUpdates;
+  late final bool _ownsCampusUpdates;
+  String? _dismissedAnnouncementId;
+  final _notificationPrefs = NotificationPrefsController();
+  final _push = PushController();
+  final _postEdits = PostEditService();
+
+  /// When each post was last edited, keyed by `kind:id` (see [postKey]).
+  Map<String, DateTime> _editedAt = {};
+
+  /// Polls on the posts shown, keyed by `kind:id` (see [postKey]).
+  Map<String, PollData> _polls = {};
+  final _pollRefresh = Debouncer();
   final _homeScrollController = ScrollController();
   List<_CampusRoom> _rooms = [];
   String? _selectedRoomId;
@@ -113,11 +162,267 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       _loadPendingApprovalCount();
     });
     unawaited(_loadMyAvatarSeed(initializeHome: true));
+    _ownsRoomActivity = widget.roomActivity == null;
+    _roomActivity = widget.roomActivity ?? RoomActivityController();
+    if (_ownsRoomActivity) {
+      _roomActivity.start();
+    } else {
+      _roomActivity.refresh();
+    }
+    _saved.addListener(_onSavedChanged);
+    unawaited(_saved.refresh());
+    _ownsCampusUpdates = widget.campusUpdates == null;
+    _campusUpdates = widget.campusUpdates ?? CampusUpdatesController();
+    if (_ownsCampusUpdates) _campusUpdates.start();
+    unawaited(_loadDismissedAnnouncement());
     _startLiveUpdates();
   }
 
   /// Live updates: posts, likes and comments appear without a refresh. The
   /// timers above stay as a slow safety net.
+  void _onSavedChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _say(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  /// Bookmark or un-bookmark a post. [kind]: `post` or `official_post`.
+  Future<void> _toggleSave(String kind, String postId) async {
+    final message = await _saved.toggle(kind, postId);
+    if (message != null) _say(message);
+  }
+
+  /// Fetches edit times for posts just loaded, so "edited" can be shown.
+  Future<void> _loadEditTimes(String kind, List<String> ids) async {
+    try {
+      final times = await _postEdits.editTimes(kind, ids);
+      if (!mounted) return;
+      setState(() {
+        _editedAt = {
+          for (final entry in _editedAt.entries)
+            if (!entry.key.startsWith('$kind:')) entry.key: entry.value,
+          for (final entry in times.entries)
+            postKey(kind, entry.key): entry.value,
+        };
+      });
+    } catch (error) {
+      debugPrint('EDIT TIMES ERROR: $error');
+    }
+  }
+
+  /// Fetches the polls attached to the given posts.
+  Future<void> _loadPolls(String kind, List<String> ids) async {
+    if (ids.isEmpty) return;
+    try {
+      final json = await _supabase.rpc(
+        'get_polls',
+        params: {'p_kind': kind, 'p_target_ids': ids},
+      );
+      final polls = PollData.listFrom(json);
+      if (!mounted) return;
+      setState(() {
+        _polls = {
+          for (final entry in _polls.entries)
+            if (!entry.key.startsWith('$kind:')) entry.key: entry.value,
+          for (final poll in polls) postKey(kind, poll.targetId): poll,
+        };
+      });
+    } catch (error) {
+      // Polls are an extra: the feed works without them.
+      debugPrint('POLLS ERROR: $error');
+    }
+  }
+
+  /// Sends a vote. Returns null on success, or a message to show.
+  Future<String?> _votePoll(
+    String kind,
+    String postId,
+    PollData poll,
+    List<String> optionIds,
+  ) async {
+    try {
+      await _supabase.rpc(
+        'vote_poll',
+        params: {'p_poll_id': poll.pollId, 'p_option_ids': optionIds},
+      );
+      unawaited(_loadPolls(kind, [postId]));
+      return null;
+    } catch (error) {
+      debugPrint('VOTE ERROR: $error');
+      return friendlyError(error);
+    }
+  }
+
+  /// Adds the poll a user wrote to the post they just published.
+  Future<void> _attachPoll(String kind, String postId, PollDraft draft) async {
+    try {
+      await _supabase.rpc(
+        'create_post_poll',
+        params: {
+          'p_kind': kind,
+          'p_post_id': postId,
+          'p_question': draft.question,
+          'p_options': draft.options,
+          'p_multiple': draft.allowsMultiple,
+          'p_closes_at': draft.closesAt?.toUtc().toIso8601String(),
+        },
+      );
+    } catch (error) {
+      debugPrint('ATTACH POLL ERROR: $error');
+      _say(
+        'Your post is published, but the poll could not be added: ${friendlyError(error)}',
+      );
+    }
+  }
+
+  Future<void> _editUnofficialPost(_CampusPost post) async {
+    final changed = await runEditPostFlow(
+      context,
+      kind: 'post',
+      postId: post.id,
+      content: post.content,
+      hasImage: post.imagePath != null,
+    );
+    if (changed && mounted) await _loadPosts(showLoading: false);
+  }
+
+  Future<void> _editOfficialPost(_OfficialPost post) async {
+    final changed = await runEditPostFlow(
+      context,
+      kind: 'official_post',
+      postId: post.id,
+      content: post.content,
+      hasImage: post.imagePath != null,
+    );
+    if (changed && mounted) await _loadOfficialPosts(showLoading: false);
+  }
+
+  static const _dismissedKey = 'dismissed_announcement_id';
+
+  Future<void> _loadDismissedAnnouncement() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (mounted) {
+        setState(
+          () => _dismissedAnnouncementId = prefs.getString(_dismissedKey),
+        );
+      }
+    } catch (_) {
+      // The banner just shows again next time.
+    }
+  }
+
+  Future<void> _dismissAnnouncement(Announcement item) async {
+    setState(() => _dismissedAnnouncementId = item.id);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_dismissedKey, item.id);
+    } catch (_) {}
+  }
+
+  /// The newest announcement as a banner, until the user closes it.
+  Widget _buildAnnouncementBanner() {
+    return ListenableBuilder(
+      listenable: _campusUpdates,
+      builder: (context, _) {
+        final item = _campusUpdates.featuredAnnouncement;
+        if (item == null || item.id == _dismissedAnnouncementId) {
+          return const SizedBox.shrink();
+        }
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: AnnouncementBanner(
+            item: item,
+            onTap: _openAnnouncements,
+            onDismiss: () => _dismissAnnouncement(item),
+          ),
+        );
+      },
+    );
+  }
+
+  bool get _isStaff => _isFaculty || _isSuperAdmin;
+
+  /// Staff and room moderators may publish events and announcements.
+  bool get _canPublishCampusContent => _isStaff || _hasModeratorInbox;
+
+  Future<void> _openEvents() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => EventsPage(
+          updates: _campusUpdates,
+          canCreate: _canPublishCampusContent,
+          isStaff: _isStaff,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openAnnouncements() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => AnnouncementsPage(
+          updates: _campusUpdates,
+          canCreate: _canPublishCampusContent,
+          isStaff: _isStaff,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openSearch() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => SearchPage(
+          initialKind: _mode == _CampusMode.official ? 'official_post' : 'post',
+          saved: _saved,
+          onOpenComments: (post) => _openCommentsFor(post.kind, post.postId),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openSavedPosts() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => SavedPostsPage(
+          saved: _saved,
+          onOpenComments: (post) => _openCommentsFor(post.kind, post.postId),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openCommentsFor(String kind, String postId) async {
+    await showModalBottomSheet<int>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => _PostRepliesSheet(
+        postId: postId,
+        officialMode: kind == 'official_post',
+      ),
+    );
+  }
+
+  Future<void> _openNotificationSettings() async {
+    unawaited(_push.refresh());
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => NotificationSettingsPage(
+          prefs: _notificationPrefs,
+          rooms: _roomActivity,
+          extraSections: [PushSettingsCard(controller: _push)],
+        ),
+      ),
+    );
+  }
+
   void _startLiveUpdates() {
     final userId = _supabase.auth.currentUser?.id;
     _liveSubscriptions.addAll([
@@ -143,6 +448,19 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     if (!mounted) return;
     final kind = signal['kind'];
     final room = signal['room_id'] as String?;
+    if (kind == 'poll') {
+      // A vote or a new poll: refresh just the polls of the posts on screen.
+      if (mode != _mode) return;
+      _pollRefresh.run(() {
+        if (!mounted) return;
+        if (mode == _CampusMode.official) {
+          _loadPolls('official_post', [for (final p in _officialPosts) p.id]);
+        } else {
+          _loadPolls('post', [for (final p in _posts) p.id]);
+        }
+      });
+      return;
+    }
     if (kind == 'post' || kind == 'resync') {
       _pendingRefresh.run(() {
         if (!mounted) return;
@@ -268,10 +586,17 @@ class _HomeFeedPageState extends State<HomeFeedPage>
 
   @override
   void dispose() {
+    _saved.removeListener(_onSavedChanged);
+    _saved.dispose();
+    if (_ownsCampusUpdates) _campusUpdates.dispose();
+    _notificationPrefs.dispose();
+    _push.dispose();
+    if (_ownsRoomActivity) _roomActivity.dispose();
     for (final subscription in _liveSubscriptions) {
       subscription.cancel();
     }
     _feedRefresh.dispose();
+    _pollRefresh.dispose();
     _notificationRefresh.dispose();
     _pendingRefresh.dispose();
     _roomUnreadTimer?.cancel();
@@ -421,6 +746,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           likeCount: (row['like_count'] as num).toInt(),
           likedByMe: row['liked_by_me'] as bool,
           replyCount: (row['comment_count'] as num).toInt(),
+          isMine: row['is_mine'] == true,
         );
       }).toList();
       // Reuse image URLs from the posts already on screen: a new signed URL on
@@ -454,6 +780,12 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         _officialLoading = false;
         _officialError = null;
       });
+      unawaited(
+        _loadEditTimes('official_post', [for (final p in hydratedPosts) p.id]),
+      );
+      unawaited(
+        _loadPolls('official_post', [for (final p in hydratedPosts) p.id]),
+      );
     } catch (error) {
       debugPrint('OFFICIAL FEED ERROR: $error');
       if (!mounted) return;
@@ -474,6 +806,18 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           onCreatePost: () => _openCreatePost(departmentCode: department.code),
           canAdminDelete: _isSuperAdmin,
           onAdminDelete: _deleteOfficialPost,
+          saved: _saved,
+          onToggleSave: (postId) => _toggleSave('official_post', postId),
+          onEditPost: (post) async {
+            final changed = await runEditPostFlow(
+              context,
+              kind: 'official_post',
+              postId: post.id,
+              content: post.content,
+              hasImage: post.imagePath != null,
+            );
+            return changed;
+          },
           onNavigateHome: () =>
               Navigator.of(context).popUntil((route) => route.isFirst),
           onOpenLiveChat: () {
@@ -490,6 +834,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     final selectedId = await Navigator.of(context).push<String>(
       MaterialPageRoute<String>(
         builder: (_) => DepartmentRoomsPage(
+          activity: _roomActivity,
           onNavigateHome: () =>
               Navigator.of(context).popUntil((route) => route.isFirst),
           onOpenLiveChat: () {
@@ -543,9 +888,13 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           initialRoomId: room.id,
           initialRoomName: room.name,
           roomPage: true,
+          roomActivity: _roomActivity,
+          campusUpdates: _campusUpdates,
         ),
       ),
     );
+    // The user may have chatted there: reorder the room lists.
+    if (mounted) unawaited(_roomActivity.refresh());
   }
 
   _CampusRoom? _roomById(String id) {
@@ -632,6 +981,10 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         _loading = false;
         _error = null;
       });
+      unawaited(
+        _loadEditTimes('post', [for (final p in postsWithImageUrls) p.id]),
+      );
+      unawaited(_loadPolls('post', [for (final p in postsWithImageUrls) p.id]));
     } catch (error) {
       debugPrint('FEED ERROR: $error');
       if (!mounted) return;
@@ -654,6 +1007,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     String? imageError;
     String? validationError;
     bool pickingImage = false;
+    PollDraft? pollDraft;
 
     final draft = await showDialog<_PostDraft>(
       context: context,
@@ -822,6 +1176,41 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                       'JPG, PNG, or WebP · up to 5 MB',
                       style: Theme.of(dialogContext).textTheme.bodySmall,
                     ),
+                    const SizedBox(height: 10),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: pollDraft == null
+                          ? OutlinedButton.icon(
+                              onPressed: () async {
+                                final created = await showCreatePollSheet(
+                                  dialogContext,
+                                  title: 'Add a poll',
+                                  confirmLabel: 'Add poll',
+                                );
+                                if (created != null) {
+                                  setDialogState(() => pollDraft = created);
+                                }
+                              },
+                              icon: const Icon(Icons.poll_outlined),
+                              label: const Text('Add poll'),
+                            )
+                          : InputChip(
+                              avatar: const Icon(Icons.poll_outlined, size: 18),
+                              label: ConstrainedBox(
+                                constraints: const BoxConstraints(
+                                  maxWidth: 220,
+                                ),
+                                child: Text(
+                                  pollDraft!.question,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              onDeleted: () =>
+                                  setDialogState(() => pollDraft = null),
+                              deleteButtonTooltipMessage: 'Remove poll',
+                            ),
+                    ),
                   ],
                 ),
               ),
@@ -860,6 +1249,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                       body: bodyController.text.trim(),
                       image: selectedImage,
                       imageBytes: selectedImageBytes,
+                      poll: pollDraft,
                     ),
                   );
                 },
@@ -920,6 +1310,9 @@ class _HomeFeedPageState extends State<HomeFeedPage>
             'p_room_id': officialRoomId,
           },
         );
+        if (draft.poll != null) {
+          await _attachPoll('official_post', postId, draft.poll!);
+        }
         await _loadOfficialPosts(showLoading: false);
       } else {
         await _supabase.from('posts').insert({
@@ -928,6 +1321,9 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           'room_id': roomId,
           'image_path': uploadedImagePath,
         });
+        if (draft.poll != null) {
+          await _attachPoll('post', postId, draft.poll!);
+        }
         await _loadPosts(showLoading: false);
       }
       if (mounted) {
@@ -980,13 +1376,8 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       }
       if (mounted) {
         final message = switch (error) {
-          StorageException(:final message, :final statusCode) =>
-            'Image upload failed${statusCode == null ? '' : ' ($statusCode)'}: '
-                '$message',
-          PostgrestException(:final message, :final code) =>
-            'Post save failed${code == null ? '' : ' ($code)'}: $message',
-          _ =>
-            'Could not publish (${error.runtimeType}). Check the terminal log.',
+          StorageException() => 'Image upload failed. Please try again.',
+          _ => 'Could not publish: ${friendlyError(error)}',
         };
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -1390,6 +1781,78 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     }
   }
 
+  /// Entries of the "more" menu (shared by every layout).
+  List<PopupMenuEntry<String>> _moreMenuEntries() => const [
+    PopupMenuItem(
+      value: 'search',
+      child: ListTile(
+        dense: true,
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(Icons.search_rounded),
+        title: Text('Search posts'),
+      ),
+    ),
+    PopupMenuItem(
+      value: 'events',
+      child: ListTile(
+        dense: true,
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(Icons.event_outlined),
+        title: Text('Events'),
+      ),
+    ),
+    PopupMenuItem(
+      value: 'announcements',
+      child: ListTile(
+        dense: true,
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(Icons.campaign_outlined),
+        title: Text('Announcements'),
+      ),
+    ),
+    PopupMenuItem(
+      value: 'saved',
+      child: ListTile(
+        dense: true,
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(Icons.bookmark_border_rounded),
+        title: Text('Saved posts'),
+      ),
+    ),
+    PopupMenuItem(
+      value: 'settings',
+      child: ListTile(
+        dense: true,
+        contentPadding: EdgeInsets.zero,
+        leading: Icon(Icons.tune_rounded),
+        title: Text('Notification settings'),
+      ),
+    ),
+  ];
+
+  void _handleMoreAction(String action) {
+    switch (action) {
+      case 'search':
+        _openSearch();
+      case 'events':
+        _openEvents();
+      case 'announcements':
+        _openAnnouncements();
+      case 'saved':
+        _openSavedPosts();
+      case 'settings':
+        _openNotificationSettings();
+    }
+  }
+
+  Widget _buildMoreMenu() => PopupMenuButton<String>(
+    tooltip: 'More',
+    padding: EdgeInsets.zero,
+    icon: const Icon(Icons.more_vert),
+    onSelected: _handleMoreAction,
+    itemBuilder: (_) => _moreMenuEntries(),
+  );
+
   List<Widget> _buildAppBarActions({required bool compact}) {
     final compactButtonStyle = compact
         ? IconButton.styleFrom(
@@ -1482,6 +1945,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           ?reports,
           live,
           ?moderators,
+          _buildMoreMenu(),
           theme,
         ];
       }
@@ -1515,10 +1979,13 @@ class _HomeFeedPageState extends State<HomeFeedPage>
               case 'profile':
                 _openProfile();
                 break;
+              default:
+                _handleMoreAction(action);
             }
           },
           itemBuilder: (context) => [
             const PopupMenuItem(value: 'profile', child: Text('My profile')),
+            ..._moreMenuEntries(),
             if (_hasModeratorInbox)
               const PopupMenuItem(
                 value: 'inbox',
@@ -1585,6 +2052,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         ),
       live,
       if (!widget.roomPage && moderators != null) moderators,
+      _buildMoreMenu(),
       theme,
       profile,
     ];
@@ -1638,6 +2106,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       ),
       onDrawerChanged: (isOpen) {
         if (mounted) setState(() => _drawerOpen = isOpen);
+        if (isOpen) unawaited(_roomActivity.refresh());
       },
       drawerScrimColor: Colors.transparent,
       drawer: Drawer(
@@ -1816,51 +2285,143 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                     );
                   },
                 )
-              : rooms.isEmpty
-              ? Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Text(
-                      _loading ? 'Loading rooms…' : 'No rooms available yet.',
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
-                )
-              : ListView.separated(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: rooms.length + 1,
-                  separatorBuilder: (context, index) =>
-                      const SizedBox(height: 6),
-                  itemBuilder: (context, index) {
-                    if (index == rooms.length) {
-                      return _buildExploreRow(
-                        title: 'Department rooms',
-                        subtitle: 'Browse every branch',
-                        icon: Icons.account_tree_outlined,
-                        onTap: () {
-                          Navigator.of(context).pop();
-                          _openDepartmentRooms();
-                        },
-                      );
-                    }
-                    final room = rooms[index];
-                    return _buildExploreRow(
-                      title: room.name,
-                      subtitle: room.id == 'departments'
-                          ? 'Browse every branch'
-                          : 'Open conversation room',
-                      icon: _roomIcon(room.id),
-                      onTap: () {
-                        Navigator.of(context).pop();
-                        if (room.id == 'departments') {
-                          _openDepartmentRooms();
-                        } else {
-                          _openCampusRoom(room);
-                        }
-                      },
-                    );
-                  },
+              : ListenableBuilder(
+                  listenable: _roomActivity,
+                  builder: (context, _) => _buildUnofficialRoomList(rooms),
                 ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _togglePinRoom(String roomId) async {
+    final message = await _roomActivity.togglePin(roomId);
+    if (message != null && mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
+  void _openRoomFromDrawer(_CampusRoom room) {
+    Navigator.of(context).pop();
+    if (room.id == 'departments') {
+      _openDepartmentRooms();
+    } else {
+      _openCampusRoom(room);
+    }
+  }
+
+  /// One room row with its last-message time, unread count and pin button.
+  Widget _buildRoomRow(_CampusRoom room, {required String defaultSubtitle}) {
+    final activity = _roomActivity.of(room.id);
+    final line = roomActivityLine(activity);
+    final isDepartment = room.id.startsWith('dept-');
+    final canPin = room.id != 'departments';
+    return _buildExploreRow(
+      title: room.name,
+      subtitle: line ?? defaultSubtitle,
+      icon: isDepartment ? Icons.school_outlined : _roomIcon(room.id),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (activity?.isMutedAt() ?? false)
+            const Padding(
+              padding: EdgeInsets.only(right: 4),
+              child: RoomMutedIcon(),
+            ),
+          RoomUnreadBadge(
+            count: activity?.unreadCount ?? 0,
+            muted: activity?.isMutedAt() ?? false,
+          ),
+          if (canPin)
+            RoomPinButton(
+              pinned: activity?.pinned ?? false,
+              size: 18,
+              onPressed: () => _togglePinRoom(room.id),
+            )
+          else
+            Icon(
+              Icons.chevron_right_rounded,
+              size: 20,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+        ],
+      ),
+      onTap: () => _openRoomFromDrawer(room),
+    );
+  }
+
+  Widget _buildUnofficialRoomList(List<_CampusRoom> rooms) {
+    if (rooms.isEmpty && _roomActivity.activity.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            _loading ? 'Loading rooms…' : 'No rooms available yet.',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
+
+    // Every room with chat activity or a pin, including department rooms.
+    final known = <String, _CampusRoom>{
+      for (final room in _rooms)
+        if (room.id != 'general' && room.id != 'official-live') room.id: room,
+    };
+    for (final id in _roomActivity.activity.keys) {
+      final room = known[id] ?? _roomById(id);
+      if (room != null) known[id] = room;
+    }
+    final ordered = _roomActivity.order(known.values.toList(), (r) => r.id);
+    final pinned = ordered.where((r) => _roomActivity.isPinned(r.id)).toList();
+    final recent = ordered
+        .where(
+          (r) =>
+              !_roomActivity.isPinned(r.id) &&
+              _roomActivity.of(r.id)?.lastMessageAt != null,
+        )
+        .take(6)
+        .toList();
+    final allRooms = _roomActivity.order(rooms, (r) => r.id);
+    final showSections = pinned.isNotEmpty || recent.isNotEmpty;
+
+    Iterable<Widget> rows(List<_CampusRoom> items) sync* {
+      for (final room in items) {
+        yield _buildRoomRow(
+          room,
+          defaultSubtitle: room.id.startsWith('dept-')
+              ? 'Department room'
+              : room.id == 'departments'
+              ? 'Browse every branch'
+              : 'Open conversation room',
+        );
+        yield const SizedBox(height: 6);
+      }
+    }
+
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        if (pinned.isNotEmpty) ...[
+          const RoomSectionLabel('Pinned'),
+          ...rows(pinned),
+        ],
+        if (recent.isNotEmpty) ...[
+          const RoomSectionLabel('Recent chats'),
+          ...rows(recent),
+        ],
+        if (showSections) const RoomSectionLabel('All rooms'),
+        ...rows(allRooms),
+        _buildExploreRow(
+          title: 'Department rooms',
+          subtitle: 'Browse every branch',
+          icon: Icons.account_tree_outlined,
+          onTap: () {
+            Navigator.of(context).pop();
+            _openDepartmentRooms();
+          },
         ),
       ],
     );
@@ -1871,6 +2432,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     required String subtitle,
     required IconData icon,
     required VoidCallback onTap,
+    Widget? trailing,
   }) {
     final colors = Theme.of(context).colorScheme;
     return Material(
@@ -1907,11 +2469,12 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                 ),
               ),
               const SizedBox(width: 8),
-              Icon(
-                Icons.chevron_right_rounded,
-                size: 20,
-                color: colors.onSurfaceVariant,
-              ),
+              trailing ??
+                  Icon(
+                    Icons.chevron_right_rounded,
+                    size: 20,
+                    color: colors.onSurfaceVariant,
+                  ),
             ],
           ),
         ),
@@ -2026,27 +2589,38 @@ class _HomeFeedPageState extends State<HomeFeedPage>
 
   Widget _buildRoomPage() {
     final colors = Theme.of(context).colorScheme;
+    // While typing in the chat, hide the intro text so the messages get the
+    // room the keyboard would otherwise take away.
+    final typingInChat =
+        _roomChatSelected && MediaQuery.viewInsetsOf(context).bottom > 0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Anonymous conversations',
-                style: Theme.of(context).textTheme.titleLarge
-                    ?.copyWith(fontWeight: FontWeight.w800),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'Posts from ${widget.initialRoomName ?? _selectedRoomName}. Your identity stays anonymous.',
-                style: Theme.of(context).textTheme.bodyMedium
-                    ?.copyWith(color: colors.onSurfaceVariant),
-              ),
-            ],
-          ),
+        AnimatedSize(
+          duration: const Duration(milliseconds: 180),
+          curve: Curves.easeOut,
+          alignment: Alignment.topCenter,
+          child: typingInChat
+              ? const SizedBox(width: double.infinity)
+              : Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Anonymous conversations',
+                        style: Theme.of(context).textTheme.titleLarge
+                            ?.copyWith(fontWeight: FontWeight.w800),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Posts from ${widget.initialRoomName ?? _selectedRoomName}. Your identity stays anonymous.',
+                        style: Theme.of(context).textTheme.bodyMedium
+                            ?.copyWith(color: colors.onSurfaceVariant),
+                      ),
+                    ],
+                  ),
+                ),
         ),
         TabBar(
           controller: _roomTabController,
@@ -2077,6 +2651,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                   embedded: true,
                   roomConversation: true,
                   roomMode: 'unofficial',
+                  activity: _roomActivity,
                   onRead: () {
                     if (mounted && _roomUnreadCount != 0) {
                       setState(() => _roomUnreadCount = 0);
@@ -2101,6 +2676,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        _buildAnnouncementBanner(),
         Align(
           alignment: Alignment.centerRight,
           child: IconButton(
@@ -2199,6 +2775,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        _buildAnnouncementBanner(),
         Card(
           color: colors.primaryContainer,
           child: Padding(
@@ -2388,6 +2965,15 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                       liking: _likingPostIds.contains(post.id),
                       canAdminDelete: _isSuperAdmin,
                       onAdminDelete: () => _deleteOfficialPost(post),
+                      saved: _saved.isSaved('official_post', post.id),
+                      onToggleSave: () => _toggleSave('official_post', post.id),
+                      onEdit: post.isMine && canStillEdit(post.createdAt)
+                          ? () => _editOfficialPost(post)
+                          : null,
+                      editedAt: _editedAt[postKey('official_post', post.id)],
+                      poll: _polls[postKey('official_post', post.id)],
+                      onVote: (poll, ids) =>
+                          _votePoll('official_post', post.id, poll, ids),
                     ),
                   ],
                 ],
@@ -2563,15 +3149,21 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                             ],
                           ),
                         ),
-                        Text(
-                          _formatDate(post.createdAt),
-                          style: Theme.of(context).textTheme.labelSmall
-                              ?.copyWith(color: colors.onSurfaceVariant),
+                        Flexible(
+                          flex: 0,
+                          child: Text(
+                            '${_formatDate(post.createdAt)}${_editedAt[postKey('post', post.id)] == null ? '' : ' · edited'}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.labelSmall
+                                ?.copyWith(color: colors.onSurfaceVariant),
+                          ),
                         ),
                         PopupMenuButton<String>(
                           tooltip: 'Post options',
                           onSelected: (value) {
                             if (value == 'delete') _deletePost(post);
+                            if (value == 'edit') _editUnofficialPost(post);
                             if (value == 'report') {
                               reportContent(
                                 context,
@@ -2581,6 +3173,17 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                             }
                           },
                           itemBuilder: (context) => [
+                            if (post.isMine && canStillEdit(post.createdAt))
+                              const PopupMenuItem(
+                                value: 'edit',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.edit_outlined),
+                                    SizedBox(width: 10),
+                                    Text('Edit post'),
+                                  ],
+                                ),
+                              ),
                             if (!post.isMine)
                               const PopupMenuItem(
                                 value: 'report',
@@ -2678,6 +3281,13 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                         style: Theme.of(context).textTheme.bodyMedium
                             ?.copyWith(color: colors.onSurfaceVariant),
                       ),
+                    if (_polls[postKey('post', post.id)] case final poll?) ...[
+                      const SizedBox(height: 10),
+                      PollCard(
+                        poll: poll,
+                        onVote: (ids) => _votePoll('post', post.id, poll, ids),
+                      ),
+                    ],
                     if (imageUrl != null) ...[
                       if (post.content.isNotEmpty) const SizedBox(height: 10),
                       PostMediaFrame(
@@ -2718,6 +3328,22 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                           icon: const Icon(Icons.mode_comment_outlined),
                         ),
                         Text('${post.replyCount}'),
+                        const Spacer(),
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          tooltip: _saved.isSaved('post', post.id)
+                              ? 'Remove from saved'
+                              : 'Save post',
+                          onPressed: () => _toggleSave('post', post.id),
+                          icon: Icon(
+                            _saved.isSaved('post', post.id)
+                                ? Icons.bookmark_rounded
+                                : Icons.bookmark_border_rounded,
+                            color: _saved.isSaved('post', post.id)
+                                ? colors.primary
+                                : null,
+                          ),
+                        ),
                       ],
                     ),
                   ],
@@ -2778,6 +3404,7 @@ class _OfficialPost {
     this.likedByMe = false,
     this.replyCount = 0,
     this.imageUrl,
+    this.isMine = false,
   });
 
   final String id;
@@ -2792,6 +3419,9 @@ class _OfficialPost {
   final int likeCount;
   final bool likedByMe;
   final int replyCount;
+
+  /// Written by the signed-in user (only they can edit it).
+  final bool isMine;
 
   _OfficialPost copyWith({
     String? imageUrl,
@@ -2811,6 +3441,7 @@ class _OfficialPost {
     likeCount: likeCount ?? this.likeCount,
     likedByMe: likedByMe ?? this.likedByMe,
     replyCount: replyCount ?? this.replyCount,
+    isMine: isMine,
   );
 }
 
@@ -2823,6 +3454,12 @@ class _OfficialPostCard extends StatelessWidget {
     this.liking = false,
     this.canAdminDelete = false,
     this.onAdminDelete,
+    this.saved = false,
+    this.onToggleSave,
+    this.onEdit,
+    this.editedAt,
+    this.poll,
+    this.onVote,
   });
 
   final _OfficialPost post;
@@ -2832,12 +3469,20 @@ class _OfficialPostCard extends StatelessWidget {
   final bool liking;
   final bool canAdminDelete;
   final VoidCallback? onAdminDelete;
+  final bool saved;
+  final VoidCallback? onToggleSave;
+
+  /// Null when the signed-in user cannot edit this post.
+  final VoidCallback? onEdit;
+  final DateTime? editedAt;
+  final PollData? poll;
+  final Future<String?> Function(PollData poll, List<String> optionIds)? onVote;
 
   String _dateLabel() {
     final date = post.createdAt.toLocal();
     final day = date.day.toString().padLeft(2, '0');
     final month = date.month.toString().padLeft(2, '0');
-    return '$day/$month/${date.year}';
+    return '$day/$month/${date.year}${editedAt == null ? '' : ' · edited'}';
   }
 
   @override
@@ -2898,6 +3543,7 @@ class _OfficialPostCard extends StatelessWidget {
                       tooltip: 'Post options',
                       onSelected: (value) {
                         if (value == 'delete') onAdminDelete?.call();
+                        if (value == 'edit') onEdit?.call();
                         if (value == 'report') {
                           reportContent(
                             context,
@@ -2907,6 +3553,11 @@ class _OfficialPostCard extends StatelessWidget {
                         }
                       },
                       itemBuilder: (_) => [
+                        if (onEdit != null)
+                          const PopupMenuItem(
+                            value: 'edit',
+                            child: Text('Edit post'),
+                          ),
                         const PopupMenuItem(
                           value: 'report',
                           child: Text('Report post'),
@@ -2918,9 +3569,14 @@ class _OfficialPostCard extends StatelessWidget {
                           ),
                       ],
                     ),
-                    Text(
-                      _dateLabel(),
-                      style: Theme.of(context).textTheme.labelSmall,
+                    Flexible(
+                      flex: 0,
+                      child: Text(
+                        _dateLabel(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.labelSmall,
+                      ),
                     ),
                   ],
                 ),
@@ -2960,6 +3616,10 @@ class _OfficialPostCard extends StatelessWidget {
                         ?.copyWith(height: 1.35),
                   ),
                 ],
+                if (poll != null && onVote != null) ...[
+                  const SizedBox(height: 10),
+                  PollCard(poll: poll!, onVote: (ids) => onVote!(poll!, ids)),
+                ],
                 if (post.imageUrl != null) ...[
                   const SizedBox(height: 10),
                   PostMediaFrame(
@@ -2997,6 +3657,19 @@ class _OfficialPostCard extends StatelessWidget {
                       icon: const Icon(Icons.mode_comment_outlined),
                     ),
                     Text('${post.replyCount}'),
+                    const Spacer(),
+                    if (onToggleSave != null)
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: saved ? 'Remove from saved' : 'Save post',
+                        onPressed: onToggleSave,
+                        icon: Icon(
+                          saved
+                              ? Icons.bookmark_rounded
+                              : Icons.bookmark_border_rounded,
+                          color: saved ? colors.primary : null,
+                        ),
+                      ),
                   ],
                 ),
               ],
@@ -3016,6 +3689,9 @@ class _OfficialDepartmentPage extends StatefulWidget {
     required this.onOpenLiveChat,
     required this.canAdminDelete,
     required this.onAdminDelete,
+    required this.saved,
+    required this.onToggleSave,
+    required this.onEditPost,
   });
 
   final CampusDepartment department;
@@ -3024,6 +3700,11 @@ class _OfficialDepartmentPage extends StatefulWidget {
   final VoidCallback onOpenLiveChat;
   final bool canAdminDelete;
   final Future<void> Function(_OfficialPost post) onAdminDelete;
+  final SavedPostsController saved;
+  final void Function(String postId) onToggleSave;
+
+  /// Runs the edit flow; true when the post changed.
+  final Future<bool> Function(_OfficialPost post) onEditPost;
 
   @override
   State<_OfficialDepartmentPage> createState() =>
@@ -3033,6 +3714,8 @@ class _OfficialDepartmentPage extends StatefulWidget {
 class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
     with SingleTickerProviderStateMixin {
   final _supabase = Supabase.instance.client;
+  Map<String, DateTime> _editedAt = {};
+  Map<String, PollData> _polls = {};
   final Set<String> _likingPostIds = {};
   List<_OfficialPost> _posts = [];
   bool _loading = true;
@@ -3052,6 +3735,7 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
   @override
   void initState() {
     super.initState();
+    widget.saved.addListener(_onSavedChanged);
     _tabController = TabController(length: 2, vsync: this)
       ..addListener(_handleTabChanged);
     _unreadTimer = Timer.periodic(
@@ -3145,6 +3829,55 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
     }
   }
 
+  void _onSavedChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _loadEditTimes(List<String> ids) async {
+    try {
+      final times = await PostEditService().editTimes('official_post', ids);
+      if (mounted) setState(() => _editedAt = times);
+    } catch (error) {
+      debugPrint('EDIT TIMES ERROR: $error');
+    }
+  }
+
+  Future<void> _loadPolls(List<String> ids) async {
+    if (ids.isEmpty) return;
+    try {
+      final json = await _supabase.rpc(
+        'get_polls',
+        params: {'p_kind': 'official_post', 'p_target_ids': ids},
+      );
+      if (!mounted) return;
+      setState(() {
+        _polls = {
+          for (final poll in PollData.listFrom(json)) poll.targetId: poll,
+        };
+      });
+    } catch (error) {
+      debugPrint('POLLS ERROR: $error');
+    }
+  }
+
+  Future<String?> _vote(
+    PollData poll,
+    List<String> optionIds,
+    String postId,
+  ) async {
+    try {
+      await _supabase.rpc(
+        'vote_poll',
+        params: {'p_poll_id': poll.pollId, 'p_option_ids': optionIds},
+      );
+      unawaited(_loadPolls([postId]));
+      return null;
+    } catch (error) {
+      debugPrint('VOTE ERROR: $error');
+      return friendlyError(error);
+    }
+  }
+
   Future<void> _loadPosts({bool showLoading = true}) async {
     if (showLoading) {
       setState(() {
@@ -3174,6 +3907,7 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
           likeCount: (row['like_count'] as num).toInt(),
           likedByMe: row['liked_by_me'] as bool,
           replyCount: (row['comment_count'] as num).toInt(),
+          isMine: row['is_mine'] == true,
         );
       }).toList();
       final reuseUrls = _urlsStillFresh;
@@ -3204,6 +3938,8 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
         _posts = hydrated;
         _loading = false;
       });
+      unawaited(_loadEditTimes([for (final p in hydrated) p.id]));
+      unawaited(_loadPolls([for (final p in hydrated) p.id]));
     } catch (error) {
       debugPrint('OFFICIAL DEPARTMENT ERROR: $error');
       if (!mounted) return;
@@ -3268,6 +4004,7 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
 
   @override
   void dispose() {
+    widget.saved.removeListener(_onSavedChanged);
     _liveSubscription?.cancel();
     _liveRefresh.dispose();
     _unreadTimer?.cancel();
@@ -3398,6 +4135,17 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
             await widget.onAdminDelete(_posts[index]);
             if (mounted) await _loadPosts();
           },
+          saved: widget.saved.isSaved('official_post', _posts[index].id),
+          onToggleSave: () => widget.onToggleSave(_posts[index].id),
+          onEdit: _posts[index].isMine && canStillEdit(_posts[index].createdAt)
+              ? () async {
+                  final changed = await widget.onEditPost(_posts[index]);
+                  if (changed && mounted) await _loadPosts(showLoading: false);
+                }
+              : null,
+          editedAt: _editedAt[_posts[index].id],
+          poll: _polls[_posts[index].id],
+          onVote: (poll, ids) => _vote(poll, ids, _posts[index].id),
         ),
       ),
     );
@@ -3460,8 +4208,10 @@ class _PostDraft {
     required this.body,
     required this.image,
     required this.imageBytes,
+    this.poll,
   });
 
+  final PollDraft? poll;
   final String title;
   final List<String> tags;
   final String body;
@@ -3485,6 +4235,8 @@ class _PostRepliesSheet extends StatefulWidget {
 class _PostRepliesSheetState extends State<_PostRepliesSheet> {
   final _supabase = Supabase.instance.client;
   final _controller = TextEditingController();
+  final _scrollController = ScrollController();
+  late final KeyboardStickyScroll _keyboardScroll;
   LiveSubscription? _liveSubscription;
   final _liveRefresh = Debouncer();
   List<Map<String, dynamic>> _replies = [];
@@ -3495,6 +4247,7 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
   @override
   void initState() {
     super.initState();
+    _keyboardScroll = KeyboardStickyScroll(_scrollController)..attach();
     _loadReplies();
     _liveSubscription = LiveSignals.instance.listen(
       widget.officialMode ? 'feed:official' : 'feed:unofficial',
@@ -3514,6 +4267,8 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
   void dispose() {
     _liveSubscription?.cancel();
     _liveRefresh.dispose();
+    _keyboardScroll.dispose();
+    _scrollController.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -3527,10 +4282,11 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
     }
     try {
       final rows = await _supabase.rpc(
-        widget.officialMode
-            ? 'get_official_post_replies'
-            : 'get_post_replies_with_avatars',
-        params: {'p_post_id': widget.postId},
+        'get_post_replies_v2',
+        params: {
+          'p_kind': widget.officialMode ? 'official_post' : 'post',
+          'p_post_id': widget.postId,
+        },
       );
       if (!mounted) return;
       setState(() {
@@ -3544,6 +4300,16 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
         _error = 'Could not load comments: ${friendlyError(error)}';
       });
     }
+  }
+
+  Future<void> _editReply(Map<String, dynamic> reply) async {
+    final changed = await runEditCommentFlow(
+      context,
+      kind: widget.officialMode ? 'official_reply' : 'reply',
+      replyId: reply['reply_id'] as String,
+      content: reply['content'] as String? ?? '',
+    );
+    if (changed && mounted) await _loadReplies(showLoading: false);
   }
 
   Future<void> _sendReply() async {
@@ -3560,7 +4326,9 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
         },
       );
       _controller.clear();
-      await _loadReplies();
+      _keyboardScroll.stickToBottom();
+      await _loadReplies(showLoading: false);
+      _keyboardScroll.jumpToBottomAfterLayout();
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -3577,8 +4345,11 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
+    // With the keyboard open, use almost the full height above it so several
+    // replies stay visible instead of a thin strip.
+    final keyboardOpen = MediaQuery.viewInsetsOf(context).bottom > 0;
     return FractionallySizedBox(
-      heightFactor: 0.78,
+      heightFactor: keyboardOpen ? 0.9 : 0.78,
       child: Padding(
         padding: EdgeInsets.only(
           left: 20,
@@ -3623,6 +4394,9 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
                       child: Text('No replies yet. Start the conversation.'),
                     )
                   : ListView.separated(
+                      controller: _scrollController,
+                      keyboardDismissBehavior:
+                          ScrollViewKeyboardDismissBehavior.onDrag,
                       itemCount: _replies.length,
                       separatorBuilder: (context, index) =>
                           const SizedBox(height: 8),
@@ -3646,23 +4420,50 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
                             borderRadius: BorderRadius.circular(14),
                           ),
                           title: Text(
-                            (reply[widget.officialMode
-                                        ? 'author_name'
-                                        : 'author_username']
-                                    as String?) ??
+                            (reply['author_label'] as String?) ??
                                 (widget.officialMode
                                     ? 'MITS member'
                                     : 'Anonymous'),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
                             style: Theme.of(context).textTheme.labelLarge,
                           ),
                           subtitle: Padding(
                             padding: const EdgeInsets.only(top: 4),
-                            child: Text(reply['content'] as String),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(reply['content'] as String),
+                                if (reply['is_mine'] == true &&
+                                    canStillEdit(
+                                      DateTime.parse(
+                                        reply['created_at'] as String,
+                                      ),
+                                    ))
+                                  Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: TextButton.icon(
+                                      onPressed: () => _editReply(reply),
+                                      icon: const Icon(
+                                        Icons.edit_outlined,
+                                        size: 16,
+                                      ),
+                                      label: const Text('Edit'),
+                                      style: TextButton.styleFrom(
+                                        visualDensity: VisualDensity.compact,
+                                        padding: EdgeInsets.zero,
+                                        tapTargetSize:
+                                            MaterialTapTargetSize.shrinkWrap,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
                           trailing: Text(
-                            _replyTime(
-                              DateTime.parse(reply['created_at'] as String),
-                            ),
+                            '${_replyTime(DateTime.parse(reply['created_at'] as String))}'
+                            '${reply['edited_at'] == null ? '' : '\nedited'}',
+                            textAlign: TextAlign.end,
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
                         );
@@ -3674,17 +4475,20 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 Expanded(
-                  child: TextField(
+                  child: SendOnEnter(
                     controller: _controller,
-                    minLines: 1,
-                    maxLines: 4,
-                    maxLength: 2000,
-                    decoration: const InputDecoration(
-                      hintText: 'Write a reply…',
-                      border: OutlineInputBorder(),
-                      counterText: '',
+                    onSend: _sendReply,
+                    child: TextField(
+                      controller: _controller,
+                      minLines: 1,
+                      maxLines: 4,
+                      maxLength: 2000,
+                      decoration: const InputDecoration(
+                        hintText: 'Write a reply…',
+                        border: OutlineInputBorder(),
+                        counterText: '',
+                      ),
                     ),
-                    onSubmitted: (_) => _sendReply(),
                   ),
                 ),
                 const SizedBox(width: 8),
