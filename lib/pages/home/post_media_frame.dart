@@ -11,7 +11,7 @@ class PostMediaFrame extends StatelessWidget {
   });
 
   final String imageUrl;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
   final double aspectRatio;
 
   @override

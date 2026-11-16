@@ -11,9 +11,7 @@ import '../../core/widgets/campus_live_action.dart';
 import '../../core/widgets/student_avatar.dart';
 import '../../core/widgets/whisper_brand.dart';
 import '../../models/campus_department.dart';
-import '../../models/profile_activity.dart';
 import '../../models/post_content.dart';
-import '../profile/profile_post_detail_page.dart';
 import '../profile/profile_page.dart';
 import '../rooms/department_rooms_page.dart';
 import '../rooms/faculty_moderator_page.dart';
@@ -21,6 +19,7 @@ import '../rooms/room_chat_page.dart';
 import '../rooms/room_post_review_page.dart';
 import '../rooms/room_moderator_contact_page.dart';
 import '../rooms/moderator_inbox_page.dart';
+import '../notifications/notifications_page.dart';
 import 'live_room_preview.dart';
 import 'post_media_frame.dart';
 
@@ -71,6 +70,8 @@ class _HomeFeedPageState extends State<HomeFeedPage>
   bool _chatJoined = false;
   late final TabController _roomTabController;
   Timer? _roomUnreadTimer;
+  Timer? _notificationTimer;
+  int _unreadNotifications = 0;
   bool _roomChatSelected = false;
   int _roomUnreadCount = 0;
   _CampusMode _mode = _CampusMode.unofficial;
@@ -88,6 +89,11 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         (_) => _loadRoomUnreadCount(),
       );
     }
+    unawaited(_loadUnreadNotifications());
+    _notificationTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _loadUnreadNotifications(),
+    );
     unawaited(_loadMyAvatarSeed(initializeHome: true));
   }
 
@@ -189,6 +195,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
   @override
   void dispose() {
     _roomUnreadTimer?.cancel();
+    _notificationTimer?.cancel();
     _roomTabController
       ..removeListener(_handleRoomTabChanged)
       ..dispose();
@@ -369,7 +376,6 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         builder: (_) => _OfficialDepartmentPage(
           department: department,
           onCreatePost: () => _openCreatePost(departmentCode: department.code),
-          onOpenPost: _openOfficialPost,
           canAdminDelete: _isSuperAdmin,
           onAdminDelete: _deleteOfficialPost,
           onNavigateHome: () =>
@@ -382,46 +388,6 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       ),
     );
     if (mounted) await _loadOfficialPosts(showLoading: false);
-  }
-
-  Future<void> _openOfficialPost(_OfficialPost post) async {
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(
-        builder: (_) => ProfilePostDetailPage(
-          officialMode: true,
-          onNavigateHome: () =>
-              Navigator.of(context).popUntil((route) => route.isFirst),
-          onOpenLiveChat: () {
-            Navigator.of(context).popUntil((route) => route.isFirst);
-            if (mounted) setState(() => _livePanelOpen = true);
-          },
-          activity: ProfileActivity(
-            type: 'post',
-            id: post.id,
-            postId: post.id,
-            scopeId: post.departmentCode,
-            scopeName: campusDepartments
-                .firstWhere(
-                  (department) => department.code == post.departmentCode,
-                  orElse: () => const CampusDepartment('', 'Campus-wide'),
-                )
-                .name,
-            activityContent: post.content,
-            postContent: post.content,
-            postAuthorName: post.authorName,
-            createdAt: post.createdAt,
-            likeCount: post.likeCount,
-            commentCount: post.replyCount,
-            imagePath: post.imagePath,
-            imageUrl: post.imageUrl,
-            likedByMe: post.likedByMe,
-          ),
-        ),
-      ),
-    );
-    if (mounted && _mode == _CampusMode.official) {
-      await _loadOfficialPosts(showLoading: false);
-    }
   }
 
   Future<void> _openDepartmentRooms() async {
@@ -444,6 +410,34 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     if (selectedId == null || !mounted) return;
     final room = _roomById(selectedId);
     if (room != null) await _openCampusRoom(room);
+  }
+
+  Future<void> _openMobileDepartments() async {
+    if (_mode == _CampusMode.unofficial) {
+      await _openDepartmentRooms();
+      return;
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            for (final department in campusDepartments)
+              ListTile(
+                leading: const Icon(Icons.school_outlined),
+                title: Text(department.name),
+                subtitle: Text(department.code.toUpperCase()),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _openOfficialDepartment(department);
+                },
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _openCampusRoom(_CampusRoom room) async {
@@ -968,6 +962,54 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     });
   }
 
+  Future<void> _toggleOfficialLike(_OfficialPost post) async {
+    if (_likingPostIds.contains(post.id)) return;
+    setState(() => _likingPostIds.add(post.id));
+    try {
+      final rows = await _supabase.rpc(
+        'toggle_official_post_like',
+        params: {'p_post_id': post.id},
+      );
+      final result = (rows as List).first as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() {
+        final index = _officialPosts.indexWhere((item) => item.id == post.id);
+        if (index >= 0) {
+          _officialPosts[index] = _officialPosts[index].copyWith(
+            likeCount: (result['like_count'] as num).toInt(),
+            likedByMe: result['liked_by_me'] as bool,
+          );
+        }
+      });
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not update like: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _likingPostIds.remove(post.id));
+    }
+  }
+
+  Future<void> _openOfficialReplies(_OfficialPost post) async {
+    final count = await showModalBottomSheet<int>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (_) => _PostRepliesSheet(postId: post.id, officialMode: true),
+    );
+    if (count == null || !mounted) return;
+    setState(() {
+      final index = _officialPosts.indexWhere((item) => item.id == post.id);
+      if (index >= 0) {
+        _officialPosts[index] = _officialPosts[index].copyWith(
+          replyCount: count,
+        );
+      }
+    });
+  }
+
   Future<void> _deletePost(_CampusPost post) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -1154,6 +1196,24 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     );
   }
 
+  Future<void> _loadUnreadNotifications() async {
+    try {
+      final value = await _supabase.rpc('get_my_unread_notification_count');
+      if (mounted) {
+        setState(() => _unreadNotifications = (value as num?)?.toInt() ?? 0);
+      }
+    } catch (_) {
+      // The app remains usable if the notification migration is not deployed.
+    }
+  }
+
+  Future<void> _openNotifications() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(builder: (_) => const NotificationsPage()),
+    );
+    await _loadUnreadNotifications();
+  }
+
   void _toggleLivePanel() {
     setState(() {
       _livePanelOpen = !_livePanelOpen;
@@ -1215,16 +1275,42 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       style: compactButtonStyle,
     );
 
+    final notifications = IconButton(
+      tooltip: 'Activity notifications',
+      onPressed: _openNotifications,
+      icon: Badge(
+        isLabelVisible: _unreadNotifications > 0,
+        label: Text(
+          _unreadNotifications > 99 ? '99+' : '$_unreadNotifications',
+        ),
+        child: const Icon(Icons.notifications_none_rounded),
+      ),
+      style: compactButtonStyle,
+    );
+    final theme = IconButton(
+      tooltip: Theme.of(context).brightness == Brightness.dark
+          ? 'Switch to light theme'
+          : 'Switch to dark theme',
+      onPressed: AppThemeScope.of(context).toggle,
+      icon: Icon(
+        Theme.of(context).brightness == Brightness.dark
+            ? Icons.light_mode_outlined
+            : Icons.dark_mode_outlined,
+      ),
+      style: compactButtonStyle,
+    );
+
     if (compact) {
+      if (!widget.roomPage) {
+        return [notifications, live, if (moderators != null) moderators, theme];
+      }
       return [
-        home,
+        notifications,
         live,
-        if (moderators != null) moderators,
         PopupMenuButton<String>(
           tooltip: 'More options',
           padding: EdgeInsets.zero,
           iconSize: 24,
-          visualDensity: VisualDensity.compact,
           onSelected: (action) {
             switch (action) {
               case 'inbox':
@@ -1245,9 +1331,13 @@ class _HomeFeedPageState extends State<HomeFeedPage>
               case 'moderators':
                 _openFacultyModeratorPage();
                 break;
+              case 'profile':
+                _openProfile();
+                break;
             }
           },
           itemBuilder: (context) => [
+            const PopupMenuItem(value: 'profile', child: Text('My profile')),
             if (_hasModeratorInbox)
               const PopupMenuItem(
                 value: 'inbox',
@@ -1280,12 +1370,12 @@ class _HomeFeedPageState extends State<HomeFeedPage>
             ),
           ],
         ),
-        profile,
       ];
     }
 
     return [
       home,
+      notifications,
       if (!widget.roomPage && _hasModeratorInbox)
         IconButton(
           tooltip: 'Moderator inbox',
@@ -1312,17 +1402,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         ),
       live,
       if (!widget.roomPage && moderators != null) moderators,
-      IconButton(
-        tooltip: Theme.of(context).brightness == Brightness.dark
-            ? 'Switch to light theme'
-            : 'Switch to dark theme',
-        onPressed: AppThemeScope.of(context).toggle,
-        icon: Icon(
-          Theme.of(context).brightness == Brightness.dark
-              ? Icons.light_mode_outlined
-              : Icons.dark_mode_outlined,
-        ),
-      ),
+      theme,
       profile,
     ];
   }
@@ -1352,19 +1432,21 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                 onPressed: () => Navigator.of(context).pop(),
                 icon: const Icon(Icons.arrow_back_rounded),
               )
+            : compactToolbar
+            ? IconButton(
+                tooltip: 'Explore rooms',
+                onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+                icon: const Icon(Icons.menu_rounded),
+              )
             : null,
         leadingWidth: compactToolbar ? 48 : null,
-        titleSpacing: compactToolbar ? 4 : null,
+        titleSpacing: compactToolbar ? 2 : null,
         title: widget.roomPage
             ? Text(widget.initialRoomName ?? 'Room')
             : WhisperBrand(
-                centered: true,
-                iconSize: compactToolbar ? 24 : 32,
-                wordmarkSize: compactToolbar
-                    ? MediaQuery.sizeOf(context).width < 400
-                          ? 0
-                          : 12
-                    : 17,
+                centered: !compactToolbar,
+                iconSize: compactToolbar ? 22 : 32,
+                wordmarkSize: compactToolbar ? 12 : 17,
                 foregroundColor: Theme.of(context).colorScheme.onSurface,
                 accentColor: Theme.of(context).colorScheme.primary,
                 bubbleInteriorColor: Theme.of(context).colorScheme.surface,
@@ -1394,9 +1476,64 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           );
         },
       ),
+      bottomNavigationBar: compactToolbar && !widget.roomPage
+          ? NavigationBar(
+              height: 66,
+              labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+              selectedIndex: 0,
+              destinations: const [
+                NavigationDestination(
+                  icon: Icon(Icons.home_outlined),
+                  selectedIcon: Icon(Icons.home_rounded),
+                  label: 'Home',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.groups_outlined),
+                  selectedIcon: Icon(Icons.groups_rounded),
+                  label: 'Departments',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.add_circle_outline_rounded),
+                  selectedIcon: Icon(Icons.add_circle_rounded),
+                  label: 'Post',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.notifications_none_rounded),
+                  selectedIcon: Icon(Icons.notifications_rounded),
+                  label: 'Activity',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.person_outline_rounded),
+                  selectedIcon: Icon(Icons.person_rounded),
+                  label: 'Profile',
+                ),
+              ],
+              onDestinationSelected: (index) {
+                switch (index) {
+                  case 0:
+                    _goHome();
+                    break;
+                  case 1:
+                    _openMobileDepartments();
+                    break;
+                  case 2:
+                    if (!_posting) _openCreatePost();
+                    break;
+                  case 3:
+                    _openNotifications();
+                    break;
+                  case 4:
+                    _openProfile();
+                    break;
+                }
+              },
+            )
+          : null,
       floatingActionButton: _livePanelOpen
           ? null
           : widget.roomPage && _roomChatSelected
+          ? null
+          : compactToolbar && !widget.roomPage
           ? null
           : FloatingActionButton.extended(
               onPressed: _posting ? null : _openCreatePost,
@@ -2042,7 +2179,12 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                   for (final post in _officialPosts) ...[
                     _OfficialPostCard(
                       post: post,
-                      onTap: () => _openOfficialPost(post),
+                      onTap: post.imageUrl == null
+                          ? null
+                          : () => _showFullImage(post.imageUrl!),
+                      onLike: () => _toggleOfficialLike(post),
+                      onComments: () => _openOfficialReplies(post),
+                      liking: _likingPostIds.contains(post.id),
                       canAdminDelete: _isSuperAdmin,
                       onAdminDelete: () => _deleteOfficialPost(post),
                     ),
@@ -2064,10 +2206,14 @@ class _HomeFeedPageState extends State<HomeFeedPage>
 
   Widget _buildWelcomeCard() {
     final colors = Theme.of(context).colorScheme;
+    final compact = MediaQuery.sizeOf(context).width < 560;
     return Card(
       color: colors.surfaceContainerLow,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 22),
+        padding: EdgeInsets.symmetric(
+          horizontal: compact ? 16 : 24,
+          vertical: compact ? 16 : 22,
+        ),
         child: Row(
           children: [
             Expanded(
@@ -2082,41 +2228,51 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                       style: Theme.of(context).textTheme.labelLarge?.copyWith(
                         color: colors.secondary,
                         fontWeight: FontWeight.w800,
-                        letterSpacing: 1.3,
+                        letterSpacing: compact ? 1 : 1.3,
+                        fontSize: compact ? 13 : null,
                       ),
                     ),
-                    const SizedBox(height: 6),
+                    SizedBox(height: compact ? 4 : 6),
                     Text(
                       'Your campus, your corner.',
                       textAlign: TextAlign.center,
-                      style: Theme.of(context).textTheme.headlineMedium
-                          ?.copyWith(fontWeight: FontWeight.w800, height: 1.05),
+                      style: compact
+                          ? Theme.of(context).textTheme.headlineSmall?.copyWith(
+                              fontWeight: FontWeight.w800,
+                              height: 1.05,
+                              fontSize: 23,
+                            )
+                          : Theme.of(context).textTheme.headlineMedium
+                                ?.copyWith(
+                                  fontWeight: FontWeight.w800,
+                                  height: 1.05,
+                                ),
                     ),
-                    const SizedBox(height: 4),
+                    SizedBox(height: compact ? 3 : 4),
                     Text(
                       'Talk freely. Stay anonymous.',
                       textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                         color: colors.onSurfaceVariant,
-                        fontSize: 17,
+                        fontSize: compact ? 14 : 17,
                       ),
                     ),
                   ],
                 ),
               ),
             ),
-            const SizedBox(width: 20),
+            SizedBox(width: compact ? 12 : 20),
             Container(
-              width: 58,
-              height: 58,
+              width: compact ? 44 : 58,
+              height: compact ? 44 : 58,
               decoration: BoxDecoration(
                 color: colors.primaryContainer,
-                borderRadius: BorderRadius.circular(20),
+                borderRadius: BorderRadius.circular(compact ? 16 : 20),
               ),
               child: Icon(
                 Icons.waving_hand_rounded,
                 color: colors.onPrimaryContainer,
-                size: 28,
+                size: compact ? 22 : 28,
               ),
             ),
           ],
@@ -2421,7 +2577,12 @@ class _OfficialPost {
   final bool likedByMe;
   final int replyCount;
 
-  _OfficialPost copyWith({String? imageUrl}) => _OfficialPost(
+  _OfficialPost copyWith({
+    String? imageUrl,
+    int? likeCount,
+    bool? likedByMe,
+    int? replyCount,
+  }) => _OfficialPost(
     id: id,
     departmentCode: departmentCode,
     authorName: authorName,
@@ -2431,9 +2592,9 @@ class _OfficialPost {
     createdAt: createdAt,
     imagePath: imagePath,
     imageUrl: imageUrl ?? this.imageUrl,
-    likeCount: likeCount,
-    likedByMe: likedByMe,
-    replyCount: replyCount,
+    likeCount: likeCount ?? this.likeCount,
+    likedByMe: likedByMe ?? this.likedByMe,
+    replyCount: replyCount ?? this.replyCount,
   );
 }
 
@@ -2441,12 +2602,18 @@ class _OfficialPostCard extends StatelessWidget {
   const _OfficialPostCard({
     required this.post,
     required this.onTap,
+    required this.onLike,
+    required this.onComments,
+    this.liking = false,
     this.canAdminDelete = false,
     this.onAdminDelete,
   });
 
   final _OfficialPost post;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
+  final VoidCallback onLike;
+  final VoidCallback onComments;
+  final bool liking;
   final bool canAdminDelete;
   final VoidCallback? onAdminDelete;
 
@@ -2581,35 +2748,32 @@ class _OfficialPostCard extends StatelessWidget {
                 const SizedBox(height: 8),
                 Row(
                   children: [
-                    Icon(
-                      Icons.favorite_border_rounded,
-                      size: 18,
-                      color: colors.onSurfaceVariant,
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: post.likedByMe ? 'Unlike post' : 'Like post',
+                      onPressed: liking ? null : onLike,
+                      icon: liking
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : Icon(
+                              post.likedByMe
+                                  ? Icons.favorite_rounded
+                                  : Icons.favorite_border_rounded,
+                              color: post.likedByMe ? colors.error : null,
+                            ),
                     ),
-                    const SizedBox(width: 5),
                     Text('${post.likeCount}'),
-                    const SizedBox(width: 16),
-                    Icon(
-                      Icons.mode_comment_outlined,
-                      size: 18,
-                      color: colors.onSurfaceVariant,
+                    const SizedBox(width: 10),
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: 'View or add comments',
+                      onPressed: onComments,
+                      icon: const Icon(Icons.mode_comment_outlined),
                     ),
-                    const SizedBox(width: 5),
                     Text('${post.replyCount}'),
-                    const Spacer(),
-                    Text(
-                      'Open post',
-                      style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                        color: colors.primary,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    Icon(
-                      Icons.arrow_forward_rounded,
-                      size: 16,
-                      color: colors.primary,
-                    ),
                   ],
                 ),
               ],
@@ -2625,7 +2789,6 @@ class _OfficialDepartmentPage extends StatefulWidget {
   const _OfficialDepartmentPage({
     required this.department,
     required this.onCreatePost,
-    required this.onOpenPost,
     required this.onNavigateHome,
     required this.onOpenLiveChat,
     required this.canAdminDelete,
@@ -2634,7 +2797,6 @@ class _OfficialDepartmentPage extends StatefulWidget {
 
   final CampusDepartment department;
   final Future<void> Function() onCreatePost;
-  final Future<void> Function(_OfficialPost post) onOpenPost;
   final VoidCallback onNavigateHome;
   final VoidCallback onOpenLiveChat;
   final bool canAdminDelete;
@@ -2648,6 +2810,7 @@ class _OfficialDepartmentPage extends StatefulWidget {
 class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
     with SingleTickerProviderStateMixin {
   final _supabase = Supabase.instance.client;
+  final Set<String> _likingPostIds = {};
   List<_OfficialPost> _posts = [];
   bool _loading = true;
   String? _error;
@@ -2803,6 +2966,50 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
     if (mounted) await _loadPosts();
   }
 
+  Future<void> _togglePostLike(_OfficialPost post) async {
+    if (_likingPostIds.contains(post.id)) return;
+    setState(() => _likingPostIds.add(post.id));
+    try {
+      final rows = await _supabase.rpc(
+        'toggle_official_post_like',
+        params: {'p_post_id': post.id},
+      );
+      final result = (rows as List).first as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() {
+        final index = _posts.indexWhere((item) => item.id == post.id);
+        if (index >= 0) {
+          _posts[index] = _posts[index].copyWith(
+            likeCount: (result['like_count'] as num).toInt(),
+            likedByMe: result['liked_by_me'] as bool,
+          );
+        }
+      });
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not update like: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _likingPostIds.remove(post.id));
+    }
+  }
+
+  Future<void> _openPostComments(_OfficialPost post) async {
+    final count = await showModalBottomSheet<int>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (_) => _PostRepliesSheet(postId: post.id, officialMode: true),
+    );
+    if (count == null || !mounted) return;
+    setState(() {
+      final index = _posts.indexWhere((item) => item.id == post.id);
+      if (index >= 0) _posts[index] = _posts[index].copyWith(replyCount: count);
+    });
+  }
+
   @override
   void dispose() {
     _unreadTimer?.cancel();
@@ -2924,7 +3131,10 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
         separatorBuilder: (context, index) => const SizedBox(height: 8),
         itemBuilder: (context, index) => _OfficialPostCard(
           post: _posts[index],
-          onTap: () => widget.onOpenPost(_posts[index]),
+          onTap: null,
+          onLike: () => _togglePostLike(_posts[index]),
+          onComments: () => _openPostComments(_posts[index]),
+          liking: _likingPostIds.contains(_posts[index].id),
           canAdminDelete: widget.canAdminDelete,
           onAdminDelete: () async {
             await widget.onAdminDelete(_posts[index]);
@@ -3005,9 +3215,10 @@ class _PostDraft {
 }
 
 class _PostRepliesSheet extends StatefulWidget {
-  const _PostRepliesSheet({required this.postId});
+  const _PostRepliesSheet({required this.postId, this.officialMode = false});
 
   final String postId;
+  final bool officialMode;
 
   @override
   State<_PostRepliesSheet> createState() => _PostRepliesSheetState();
@@ -3040,7 +3251,9 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
     });
     try {
       final rows = await _supabase.rpc(
-        'get_post_replies_with_avatars',
+        widget.officialMode
+            ? 'get_official_post_replies'
+            : 'get_post_replies_with_avatars',
         params: {'p_post_id': widget.postId},
       );
       if (!mounted) return;
@@ -3048,11 +3261,11 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
         _replies = List<Map<String, dynamic>>.from(rows);
         _loading = false;
       });
-    } catch (_) {
+    } catch (error) {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = 'Could not load replies.';
+        _error = 'Could not load comments: $error';
       });
     }
   }
@@ -3062,16 +3275,20 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
     if (content.isEmpty || _sending) return;
     setState(() => _sending = true);
     try {
-      await _supabase.from('post_replies').insert({
-        'post_id': widget.postId,
-        'content': content,
-      });
+      await _supabase.rpc(
+        'submit_post_reply',
+        params: {
+          'p_post_id': widget.postId,
+          'p_content': content,
+          'p_mode': widget.officialMode ? 'official' : 'unofficial',
+        },
+      );
       _controller.clear();
       await _loadReplies();
-    } catch (_) {
+    } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not send your reply.')),
+          SnackBar(content: Text('Could not send comment: $error')),
         );
       }
     } finally {
@@ -3139,16 +3356,25 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
                             vertical: 4,
                           ),
                           tileColor: colors.surfaceContainerLow,
-                          leading: StudentAvatar(
-                            seed: reply['avatar_seed'] as String?,
-                            size: 34,
-                          ),
+                          leading: widget.officialMode
+                              ? const CircleAvatar(
+                                  child: Icon(Icons.account_circle_outlined),
+                                )
+                              : StudentAvatar(
+                                  seed: reply['avatar_seed'] as String?,
+                                  size: 34,
+                                ),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(14),
                           ),
                           title: Text(
-                            (reply['author_username'] as String?) ??
-                                'Anonymous',
+                            (reply[widget.officialMode
+                                        ? 'author_name'
+                                        : 'author_username']
+                                    as String?) ??
+                                (widget.officialMode
+                                    ? 'MITS member'
+                                    : 'Anonymous'),
                             style: Theme.of(context).textTheme.labelLarge,
                           ),
                           subtitle: Padding(
