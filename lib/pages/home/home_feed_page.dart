@@ -23,6 +23,14 @@ import '../rooms/moderator_inbox_page.dart';
 import '../notifications/notifications_page.dart';
 import 'live_room_preview.dart';
 import 'post_media_frame.dart';
+import '../../core/utils/error_message.dart';
+import '../../services/report_service.dart';
+import '../rooms/report_queue_page.dart';
+import '../../services/live_signals.dart';
+
+/// Signed image URLs last an hour. They are reused across live refreshes while
+/// younger than this, then signed again.
+const _signedUrlReuseWindow = Duration(minutes: 50);
 
 enum _CampusMode { unofficial, official }
 
@@ -73,6 +81,14 @@ class _HomeFeedPageState extends State<HomeFeedPage>
   late final TabController _roomTabController;
   Timer? _roomUnreadTimer;
   Timer? _notificationTimer;
+  DateTime? _urlsSignedAt;
+  bool get _urlsStillFresh =>
+      _urlsSignedAt != null &&
+      DateTime.now().difference(_urlsSignedAt!) < _signedUrlReuseWindow;
+  final List<LiveSubscription> _liveSubscriptions = [];
+  final _feedRefresh = Debouncer();
+  final _notificationRefresh = Debouncer();
+  final _pendingRefresh = Debouncer();
   int _unreadNotifications = 0;
   bool _roomChatSelected = false;
   int _roomUnreadCount = 0;
@@ -92,14 +108,63 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       );
     }
     unawaited(_loadUnreadNotifications());
-    _notificationTimer = Timer.periodic(
-      const Duration(seconds: 30),
-      (_) {
-        _loadUnreadNotifications();
-        _loadPendingApprovalCount();
-      },
-    );
+    _notificationTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      _loadUnreadNotifications();
+      _loadPendingApprovalCount();
+    });
     unawaited(_loadMyAvatarSeed(initializeHome: true));
+    _startLiveUpdates();
+  }
+
+  /// Live updates: posts, likes and comments appear without a refresh. The
+  /// timers above stay as a slow safety net.
+  void _startLiveUpdates() {
+    final userId = _supabase.auth.currentUser?.id;
+    _liveSubscriptions.addAll([
+      LiveSignals.instance.listen(
+        'feed:unofficial',
+        (signal) => _handleFeedSignal(_CampusMode.unofficial, signal),
+      ),
+      LiveSignals.instance.listen(
+        'feed:official',
+        (signal) => _handleFeedSignal(_CampusMode.official, signal),
+      ),
+      if (userId != null)
+        LiveSignals.instance.listen('user:$userId', (_) {
+          _notificationRefresh.run(() {
+            if (!mounted) return;
+            _loadUnreadNotifications();
+          });
+        }),
+    ]);
+  }
+
+  void _handleFeedSignal(_CampusMode mode, Map<String, dynamic> signal) {
+    if (!mounted) return;
+    final kind = signal['kind'];
+    final room = signal['room_id'] as String?;
+    if (kind == 'post' || kind == 'resync') {
+      _pendingRefresh.run(() {
+        if (!mounted) return;
+        _loadPendingApprovalCount();
+      });
+    }
+    if (mode != _mode) return;
+    final current = _selectedRoomId ?? 'general';
+    final affectsThisRoom =
+        kind == 'resync' ||
+        room == null ||
+        room == current ||
+        room == 'general';
+    if (!affectsThisRoom) return;
+    _feedRefresh.run(() {
+      if (!mounted) return;
+      if (mode == _CampusMode.official) {
+        _loadOfficialPosts(showLoading: false);
+      } else {
+        _loadPosts(showLoading: false);
+      }
+    });
   }
 
   void _handleRoomTabChanged() {
@@ -159,8 +224,8 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         final rooms = await _supabase.rpc('list_my_moderated_rooms');
         // Super Admin has room-wide moderation access even without a
         // room_moderators assignment row (those rows are for students).
-        hasModeratorInbox = hasModeratorInbox ||
-            (rooms is List && rooms.isNotEmpty);
+        hasModeratorInbox =
+            hasModeratorInbox || (rooms is List && rooms.isNotEmpty);
       } catch (_) {}
       if (mounted) {
         setState(() {
@@ -203,6 +268,12 @@ class _HomeFeedPageState extends State<HomeFeedPage>
 
   @override
   void dispose() {
+    for (final subscription in _liveSubscriptions) {
+      subscription.cancel();
+    }
+    _feedRefresh.dispose();
+    _notificationRefresh.dispose();
+    _pendingRefresh.dispose();
     _roomUnreadTimer?.cancel();
     _notificationTimer?.cancel();
     _roomTabController
@@ -258,8 +329,9 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         'is_active_room_moderator',
         params: {'p_room': roomId, 'p_mode': _mode.name},
       );
-      if (mounted)
+      if (mounted) {
         setState(() => _canReviewRoomPosts = _isSuperAdmin || result == true);
+      }
     } catch (_) {
       if (mounted) setState(() => _canReviewRoomPosts = _isSuperAdmin);
     }
@@ -351,9 +423,20 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           replyCount: (row['comment_count'] as num).toInt(),
         );
       }).toList();
+      // Reuse image URLs from the posts already on screen: a new signed URL on
+      // every live refresh would make every image reload and flicker.
+      final reuseUrls = _urlsStillFresh;
+      final knownUrls = {
+        if (reuseUrls)
+          for (final old in _officialPosts)
+            if (old.imagePath != null && old.imageUrl != null)
+              old.imagePath!: old.imageUrl!,
+      };
       final hydratedPosts = await Future.wait(
         posts.map((post) async {
           if (post.imagePath == null) return post;
+          final known = knownUrls[post.imagePath!];
+          if (known != null) return post.copyWith(imageUrl: known);
           try {
             final url = await _supabase.storage
                 .from(_officialPostImageBucket)
@@ -364,6 +447,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           }
         }),
       );
+      if (!reuseUrls) _urlsSignedAt = DateTime.now();
       if (!mounted) return;
       setState(() {
         _officialPosts = hydratedPosts;
@@ -371,12 +455,14 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         _officialError = null;
       });
     } catch (error) {
+      debugPrint('OFFICIAL FEED ERROR: $error');
       if (!mounted) return;
+      // A failed background refresh keeps the posts already shown.
+      if (!showLoading && _officialPosts.isNotEmpty) return;
       setState(() {
         _officialLoading = false;
         _officialError = 'Could not load Official posts. Please try again.';
       });
-      debugPrint('OFFICIAL FEED ERROR: $error');
     }
   }
 
@@ -515,10 +601,19 @@ class _HomeFeedPageState extends State<HomeFeedPage>
             ),
           )
           .toList();
+      final reuseUrls = _urlsStillFresh;
+      final knownUrls = {
+        if (reuseUrls)
+          for (final old in _posts)
+            if (old.imagePath != null && old.imageUrl != null)
+              old.imagePath!: old.imageUrl!,
+      };
       final postsWithImageUrls = await Future.wait(
         posts.map((post) async {
           final path = post.imagePath;
           if (path == null) return post;
+          final known = knownUrls[path];
+          if (known != null) return post.copyWith(imageUrl: known);
           try {
             final url = await _supabase.storage
                 .from(_postImageBucket)
@@ -530,14 +625,18 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         }),
       );
 
+      if (!reuseUrls) _urlsSignedAt = DateTime.now();
       if (!mounted) return;
       setState(() {
         _posts = postsWithImageUrls;
         _loading = false;
         _error = null;
       });
-    } catch (_) {
+    } catch (error) {
+      debugPrint('FEED ERROR: $error');
       if (!mounted) return;
+      // A failed background refresh keeps the posts already shown.
+      if (!showLoading && _posts.isNotEmpty) return;
       setState(() {
         _loading = false;
         _error = 'Could not load posts. Please try again.';
@@ -832,7 +931,9 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         await _loadPosts(showLoading: false);
       }
       if (mounted) {
-        var directPost = _isFaculty || _isSuperAdmin ||
+        var directPost =
+            _isFaculty ||
+            _isSuperAdmin ||
             (modeAtOpen == _CampusMode.unofficial && roomId == 'general');
         if (!directPost) {
           try {
@@ -995,7 +1096,9 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not update like: $error')),
+          SnackBar(
+            content: Text('Could not update like: ${friendlyError(error)}'),
+          ),
         );
       }
     } finally {
@@ -1106,10 +1209,13 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       ScaffoldMessenger.of(context)
           .showSnackBar(const SnackBar(content: Text('Post deleted.')));
     } catch (error) {
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not delete post: $error')),
+          SnackBar(
+            content: Text('Could not delete post: ${friendlyError(error)}'),
+          ),
         );
+      }
     }
   }
 
@@ -1220,6 +1326,12 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     } catch (_) {
       // Keep the home feed usable if the review-inbox migration is not deployed.
     }
+  }
+
+  Future<void> _openReportQueue() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(builder: (_) => const ReportQueuePage()),
+    );
   }
 
   Future<void> _openHomePostReview() async {
@@ -1341,6 +1453,14 @@ class _HomeFeedPageState extends State<HomeFeedPage>
             style: compactButtonStyle,
           )
         : null;
+    final reports = _isSuperAdmin
+        ? IconButton(
+            tooltip: 'Reported content',
+            onPressed: _openReportQueue,
+            icon: const Icon(Icons.flag_outlined),
+            style: compactButtonStyle,
+          )
+        : null;
     final theme = IconButton(
       tooltip: Theme.of(context).brightness == Brightness.dark
           ? 'Switch to light theme'
@@ -1358,9 +1478,10 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       if (!widget.roomPage) {
         return [
           notifications,
-          if (pendingApprovals != null) pendingApprovals,
+          ?pendingApprovals,
+          ?reports,
           live,
-          if (moderators != null) moderators,
+          ?moderators,
           theme,
         ];
       }
@@ -1442,7 +1563,8 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           onPressed: _openModeratorInbox,
           icon: const Icon(Icons.inbox_outlined),
         ),
-      if (pendingApprovals != null) pendingApprovals,
+      ?pendingApprovals,
+      ?reports,
       if (widget.roomPage)
         IconButton(
           tooltip: 'Explore rooms',
@@ -1538,56 +1660,74 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         },
       ),
       bottomNavigationBar: compactToolbar && !widget.roomPage
-          ? NavigationBar(
-              height: 66,
-              labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
-              selectedIndex: 0,
-              destinations: const [
-                NavigationDestination(
-                  icon: Icon(Icons.home_outlined),
-                  selectedIcon: Icon(Icons.home_rounded),
-                  label: 'Home',
+          ? MediaQuery.withClampedTextScaling(
+              // Keep the five labels on one line even with large system text.
+              maxScaleFactor: 1.1,
+              child: NavigationBarTheme(
+                // Smaller, tighter labels so "Departments" stays on one line on
+                // narrow phones instead of wrapping its last letter.
+                data: NavigationBarThemeData(
+                  labelTextStyle: WidgetStateProperty.resolveWith((states) {
+                    final selected = states.contains(WidgetState.selected);
+                    return TextStyle(
+                      fontSize: 10.5,
+                      letterSpacing: 0,
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                    );
+                  }),
                 ),
-                NavigationDestination(
-                  icon: Icon(Icons.groups_outlined),
-                  selectedIcon: Icon(Icons.groups_rounded),
-                  label: 'Departments',
+                child: NavigationBar(
+                  height: 66,
+                  labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+                  selectedIndex: 0,
+                  destinations: const [
+                    NavigationDestination(
+                      icon: Icon(Icons.home_outlined),
+                      selectedIcon: Icon(Icons.home_rounded),
+                      label: 'Home',
+                    ),
+                    NavigationDestination(
+                      icon: Icon(Icons.groups_outlined),
+                      selectedIcon: Icon(Icons.groups_rounded),
+                      label: 'Departments',
+                    ),
+                    NavigationDestination(
+                      icon: Icon(Icons.add_circle_outline_rounded),
+                      selectedIcon: Icon(Icons.add_circle_rounded),
+                      label: 'Post',
+                    ),
+                    NavigationDestination(
+                      icon: Icon(Icons.notifications_none_rounded),
+                      selectedIcon: Icon(Icons.notifications_rounded),
+                      label: 'Activity',
+                    ),
+                    NavigationDestination(
+                      icon: Icon(Icons.person_outline_rounded),
+                      selectedIcon: Icon(Icons.person_rounded),
+                      label: 'Profile',
+                    ),
+                  ],
+                  onDestinationSelected: (index) {
+                    switch (index) {
+                      case 0:
+                        _goHome();
+                        break;
+                      case 1:
+                        _openMobileDepartments();
+                        break;
+                      case 2:
+                        if (!_posting) _openCreatePost();
+                        break;
+                      case 3:
+                        _openNotifications();
+                        break;
+                      case 4:
+                        _openProfile();
+                        break;
+                    }
+                  },
                 ),
-                NavigationDestination(
-                  icon: Icon(Icons.add_circle_outline_rounded),
-                  selectedIcon: Icon(Icons.add_circle_rounded),
-                  label: 'Post',
-                ),
-                NavigationDestination(
-                  icon: Icon(Icons.notifications_none_rounded),
-                  selectedIcon: Icon(Icons.notifications_rounded),
-                  label: 'Activity',
-                ),
-                NavigationDestination(
-                  icon: Icon(Icons.person_outline_rounded),
-                  selectedIcon: Icon(Icons.person_rounded),
-                  label: 'Profile',
-                ),
-              ],
-              onDestinationSelected: (index) {
-                switch (index) {
-                  case 0:
-                    _goHome();
-                    break;
-                  case 1:
-                    _openMobileDepartments();
-                    break;
-                  case 2:
-                    if (!_posting) _openCreatePost();
-                    break;
-                  case 3:
-                    _openNotifications();
-                    break;
-                  case 4:
-                    _openProfile();
-                    break;
-                }
-              },
+              ),
             )
           : null,
       floatingActionButton: _livePanelOpen
@@ -1873,7 +2013,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
               onClose: _toggleLivePanel,
             )
           : LiveRoomPreview(
-              key: ValueKey('campus-live-side-panel-' + roomId),
+              key: ValueKey('campus-live-side-panel-$roomId'),
               roomId: roomId,
               roomName: roomName,
               expanded: true,
@@ -2377,15 +2517,11 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     ].join('\n\n');
     return LayoutBuilder(
       builder: (context, constraints) {
-        // Keep text-only posts at roughly half the height of the image area
-        // while allowing longer text to grow naturally.
-        final textOnlyMinHeight = imageUrl == null
-            ? constraints.maxWidth / 2.9 + 72
-            : 0.0;
+        // Posts size to their content, so short text posts stay compact.
         return _HoverablePostSurface(
           colors: colors,
           child: ConstrainedBox(
-            constraints: BoxConstraints(minHeight: textOnlyMinHeight),
+            constraints: const BoxConstraints(),
             child: Container(
               decoration: BoxDecoration(
                 border: Border(
@@ -2432,14 +2568,32 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                           style: Theme.of(context).textTheme.labelSmall
                               ?.copyWith(color: colors.onSurfaceVariant),
                         ),
-                        if (post.isMine || _isSuperAdmin)
-                          PopupMenuButton<String>(
-                            tooltip: 'Post options',
-                            onSelected: (value) {
-                              if (value == 'delete') _deletePost(post);
-                            },
-                            itemBuilder: (context) => const [
-                              PopupMenuItem(
+                        PopupMenuButton<String>(
+                          tooltip: 'Post options',
+                          onSelected: (value) {
+                            if (value == 'delete') _deletePost(post);
+                            if (value == 'report') {
+                              reportContent(
+                                context,
+                                target: ReportTarget.post,
+                                targetId: post.id,
+                              );
+                            }
+                          },
+                          itemBuilder: (context) => [
+                            if (!post.isMine)
+                              const PopupMenuItem(
+                                value: 'report',
+                                child: Row(
+                                  children: [
+                                    Icon(Icons.flag_outlined),
+                                    SizedBox(width: 10),
+                                    Text('Report post'),
+                                  ],
+                                ),
+                              ),
+                            if (post.isMine || _isSuperAdmin)
+                              const PopupMenuItem(
                                 value: 'delete',
                                 child: Row(
                                   children: [
@@ -2449,8 +2603,8 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                                   ],
                                 ),
                               ),
-                            ],
-                          ),
+                          ],
+                        ),
                       ],
                     ),
                     const SizedBox(height: 10),
@@ -2484,6 +2638,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
                             ? () => _showFullCaption(fullText)
                             : null,
                         borderRadius: BorderRadius.circular(8),
+                        hoverColor: Colors.transparent,
                         child: Padding(
                           padding: const EdgeInsets.symmetric(vertical: 2),
                           child: Align(
@@ -2691,11 +2846,6 @@ class _OfficialPostCard extends StatelessWidget {
     final formatted = PostContent.decode(post.content);
     return LayoutBuilder(
       builder: (context, constraints) => Container(
-        constraints: BoxConstraints(
-          minHeight: post.imageUrl == null
-              ? constraints.maxWidth / 2.9 + 72
-              : 0,
-        ),
         decoration: BoxDecoration(
           border: Border(
             bottom: BorderSide(
@@ -2705,6 +2855,7 @@ class _OfficialPostCard extends StatelessWidget {
         ),
         child: InkWell(
           onTap: onTap,
+          hoverColor: Colors.transparent,
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
             child: Column(
@@ -2743,19 +2894,30 @@ class _OfficialPostCard extends StatelessWidget {
                         ],
                       ),
                     ),
-                    if (canAdminDelete && onAdminDelete != null)
-                      PopupMenuButton<String>(
-                        tooltip: 'Post options',
-                        onSelected: (value) {
-                          if (value == 'delete') onAdminDelete?.call();
-                        },
-                        itemBuilder: (_) => const [
-                          PopupMenuItem(
+                    PopupMenuButton<String>(
+                      tooltip: 'Post options',
+                      onSelected: (value) {
+                        if (value == 'delete') onAdminDelete?.call();
+                        if (value == 'report') {
+                          reportContent(
+                            context,
+                            target: ReportTarget.officialPost,
+                            targetId: post.id,
+                          );
+                        }
+                      },
+                      itemBuilder: (_) => [
+                        const PopupMenuItem(
+                          value: 'report',
+                          child: Text('Report post'),
+                        ),
+                        if (canAdminDelete && onAdminDelete != null)
+                          const PopupMenuItem(
                             value: 'delete',
                             child: Text('Delete post'),
                           ),
-                        ],
-                      ),
+                      ],
+                    ),
                     Text(
                       _dateLabel(),
                       style: Theme.of(context).textTheme.labelSmall,
@@ -2877,6 +3039,12 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
   String? _error;
   late final TabController _tabController;
   Timer? _unreadTimer;
+  DateTime? _urlsSignedAt;
+  bool get _urlsStillFresh =>
+      _urlsSignedAt != null &&
+      DateTime.now().difference(_urlsSignedAt!) < _signedUrlReuseWindow;
+  LiveSubscription? _liveSubscription;
+  final _liveRefresh = Debouncer();
   bool _chatSelected = false;
   int _unreadCount = 0;
   bool _canReviewPosts = false;
@@ -2891,20 +3059,32 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
       (_) => _loadUnreadCount(),
     );
     _loadPosts();
+    _liveSubscription = LiveSignals.instance.listen('feed:official', (signal) {
+      final room = signal['room_id'] as String?;
+      final relevant =
+          signal['kind'] == 'resync' ||
+          room == null ||
+          room == 'dept-${widget.department.code}';
+      if (!relevant) return;
+      _liveRefresh.run(() {
+        if (mounted) _loadPosts(showLoading: false);
+      });
+    });
     _loadUnreadCount();
     _loadReviewAccess();
   }
 
   Future<void> _loadReviewAccess() async {
-    final roomId = 'dept-' + widget.department.code;
+    final roomId = 'dept-${widget.department.code}';
     try {
       final moderator = await _supabase.rpc(
         'is_active_room_moderator',
         params: {'p_room': roomId, 'p_mode': 'official'},
       );
       final admin = await _supabase.rpc('is_super_admin');
-      if (mounted)
+      if (mounted) {
         setState(() => _canReviewPosts = moderator == true || admin == true);
+      }
     } catch (_) {
       // Keep regular room browsing available if the optional review check fails.
     }
@@ -2914,7 +3094,7 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
     await Navigator.of(context).push<void>(
       MaterialPageRoute<void>(
         builder: (_) => RoomPostReviewPage(
-          roomId: 'dept-' + widget.department.code,
+          roomId: 'dept-${widget.department.code}',
           roomName: widget.department.name,
           mode: 'official',
         ),
@@ -2927,7 +3107,7 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
     await Navigator.of(context).push<void>(
       MaterialPageRoute<void>(
         builder: (_) => RoomModeratorContactPage(
-          roomId: 'dept-' + widget.department.code,
+          roomId: 'dept-${widget.department.code}',
           roomName: widget.department.name,
           mode: 'official',
         ),
@@ -2954,7 +3134,7 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
       final unread = await _supabase.rpc(
         'get_room_chat_unread',
         params: {
-          'p_room_id': 'dept-' + widget.department.code,
+          'p_room_id': 'dept-${widget.department.code}',
           'p_mode': 'official',
         },
       );
@@ -2965,18 +3145,20 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
     }
   }
 
-  Future<void> _loadPosts() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+  Future<void> _loadPosts({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
     try {
       final rows = await _supabase.rpc(
         'get_official_posts_with_activity',
         params: {
           'p_department_code': widget.department.code,
           'p_limit': 100,
-          'p_room_id': 'dept-' + widget.department.code,
+          'p_room_id': 'dept-${widget.department.code}',
         },
       );
       final posts = List<Map<String, dynamic>>.from(rows).map((row) {
@@ -2994,9 +3176,18 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
           replyCount: (row['comment_count'] as num).toInt(),
         );
       }).toList();
+      final reuseUrls = _urlsStillFresh;
+      final knownUrls = {
+        if (reuseUrls)
+          for (final old in _posts)
+            if (old.imagePath != null && old.imageUrl != null)
+              old.imagePath!: old.imageUrl!,
+      };
       final hydrated = await Future.wait(
         posts.map((post) async {
           if (post.imagePath == null) return post;
+          final known = knownUrls[post.imagePath!];
+          if (known != null) return post.copyWith(imageUrl: known);
           try {
             final url = await _supabase.storage
                 .from(_officialPostImageBucket)
@@ -3007,18 +3198,20 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
           }
         }),
       );
+      if (!reuseUrls) _urlsSignedAt = DateTime.now();
       if (!mounted) return;
       setState(() {
         _posts = hydrated;
         _loading = false;
       });
     } catch (error) {
+      debugPrint('OFFICIAL DEPARTMENT ERROR: $error');
       if (!mounted) return;
+      if (!showLoading && _posts.isNotEmpty) return;
       setState(() {
         _error = 'Could not load this department. Please try again.';
         _loading = false;
       });
-      debugPrint('OFFICIAL DEPARTMENT ERROR: $error');
     }
   }
 
@@ -3049,7 +3242,9 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not update like: $error')),
+          SnackBar(
+            content: Text('Could not update like: ${friendlyError(error)}'),
+          ),
         );
       }
     } finally {
@@ -3073,6 +3268,8 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
 
   @override
   void dispose() {
+    _liveSubscription?.cancel();
+    _liveRefresh.dispose();
     _unreadTimer?.cancel();
     _tabController
       ..removeListener(_handleTabChanged)
@@ -3143,7 +3340,7 @@ class _OfficialDepartmentPageState extends State<_OfficialDepartmentPage>
                     key: ValueKey(
                       'official-room-chat-${widget.department.code}',
                     ),
-                    roomId: 'dept-' + widget.department.code,
+                    roomId: 'dept-${widget.department.code}',
                     roomName: widget.department.name,
                     embedded: true,
                     roomConversation: true,
@@ -3288,6 +3485,8 @@ class _PostRepliesSheet extends StatefulWidget {
 class _PostRepliesSheetState extends State<_PostRepliesSheet> {
   final _supabase = Supabase.instance.client;
   final _controller = TextEditingController();
+  LiveSubscription? _liveSubscription;
+  final _liveRefresh = Debouncer();
   List<Map<String, dynamic>> _replies = [];
   bool _loading = true;
   bool _sending = false;
@@ -3297,19 +3496,35 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
   void initState() {
     super.initState();
     _loadReplies();
+    _liveSubscription = LiveSignals.instance.listen(
+      widget.officialMode ? 'feed:official' : 'feed:unofficial',
+      (signal) {
+        final kind = signal['kind'];
+        final forThisPost = signal['post_id']?.toString() == widget.postId;
+        if (kind == 'resync' || (kind == 'reply' && forThisPost)) {
+          _liveRefresh.run(() {
+            if (mounted) _loadReplies(showLoading: false);
+          });
+        }
+      },
+    );
   }
 
   @override
   void dispose() {
+    _liveSubscription?.cancel();
+    _liveRefresh.dispose();
     _controller.dispose();
     super.dispose();
   }
 
-  Future<void> _loadReplies() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+  Future<void> _loadReplies({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
     try {
       final rows = await _supabase.rpc(
         widget.officialMode
@@ -3326,7 +3541,7 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = 'Could not load comments: $error';
+        _error = 'Could not load comments: ${friendlyError(error)}';
       });
     }
   }
@@ -3349,7 +3564,9 @@ class _PostRepliesSheetState extends State<_PostRepliesSheet> {
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not send comment: $error')),
+          SnackBar(
+            content: Text('Could not send comment: ${friendlyError(error)}'),
+          ),
         );
       }
     } finally {
@@ -3537,34 +3754,14 @@ class _UnreadMessageBadge extends StatelessWidget {
   }
 }
 
-class _HoverablePostSurface extends StatefulWidget {
+/// Wraps a post card. Posts have no hover highlight on purpose: a tint that
+/// fades in and out as the pointer moves over the feed looked like flickering.
+class _HoverablePostSurface extends StatelessWidget {
   const _HoverablePostSurface({required this.colors, required this.child});
 
   final ColorScheme colors;
   final Widget child;
 
   @override
-  State<_HoverablePostSurface> createState() => _HoverablePostSurfaceState();
-}
-
-class _HoverablePostSurfaceState extends State<_HoverablePostSurface> {
-  bool _hovered = false;
-
-  @override
-  Widget build(BuildContext context) {
-    return MouseRegion(
-      onEnter: (_) => setState(() => _hovered = true),
-      onExit: (_) => setState(() => _hovered = false),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 160),
-        decoration: BoxDecoration(
-          color: _hovered
-              ? widget.colors.surfaceContainerLow
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: widget.child,
-      ),
-    );
-  }
+  Widget build(BuildContext context) => child;
 }

@@ -5,7 +5,11 @@ const postTagOptions = ['Doubt/Query', 'Urgent', 'Tea', 'Academic'];
 const _postContentMarker = 'WC_POST_V1:';
 
 class PostContent {
-  const PostContent({required this.title, required this.tags, required this.body});
+  const PostContent({
+    required this.title,
+    required this.tags,
+    required this.body,
+  });
 
   final String title;
   final List<String> tags;
@@ -41,5 +45,46 @@ class PostContent {
     } on TypeError {
       return PostContent(title: '', tags: const [], body: value);
     }
+  }
+
+  /// Short readable text for a stored post that may have been cut off (for
+  /// example the 140-character preview kept with a notification). A cut-off
+  /// encoded post cannot be parsed as JSON, so the title and body are read
+  /// straight from the text instead of showing the raw encoding.
+  static String previewText(String value) {
+    if (!value.startsWith(_postContentMarker)) return value.trim();
+    final full = decode(value);
+    // decode() returns the raw text as the body when it cannot parse it.
+    final parsed = full.body != value;
+    if (parsed &&
+        (full.title.isNotEmpty ||
+            full.body.isNotEmpty ||
+            full.tags.isNotEmpty)) {
+      return [
+        if (full.title.isNotEmpty) full.title,
+        if (full.body.isNotEmpty) full.body,
+      ].join(' · ');
+    }
+    String? field(String name) {
+      final match = RegExp('"$name":"((?:[^"\\\\]|\\\\.)*)').firstMatch(value);
+      if (match == null) return null;
+      var raw = match.group(1)!;
+      // A cut can end in the middle of a unicode escape (backslash, u, and
+      // fewer than four digits); drop that fragment.
+      raw = raw.replaceFirst(RegExp(r'\\u[0-9a-fA-F]{0,3}$'), '');
+      try {
+        return jsonDecode('"$raw"') as String;
+      } on FormatException {
+        return raw;
+      }
+    }
+
+    final title = field('title') ?? '';
+    final body = field('body') ?? '';
+    final text = [
+      if (title.isNotEmpty) title,
+      if (body.isNotEmpty) body,
+    ].join(' · ');
+    return text.isEmpty ? 'Post' : text;
   }
 }

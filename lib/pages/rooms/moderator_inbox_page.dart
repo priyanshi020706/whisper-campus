@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'room_moderator_contact_page.dart';
+import '../../core/utils/error_message.dart';
 
 class ModeratorInboxPage extends StatefulWidget {
   const ModeratorInboxPage({super.key});
@@ -34,7 +35,7 @@ class _ModeratorInboxPageState extends State<ModeratorInboxPage> {
       setState(() { _conversations = List<Map<String, dynamic>>.from(rows); _loading = false; });
     } catch (error) {
       if (!mounted) return;
-      setState(() { _error = error.toString(); _loading = false; });
+      setState(() { _error = friendlyError(error); _loading = false; });
     }
   }
 
@@ -84,7 +85,7 @@ class _ModeratorInboxPageState extends State<ModeratorInboxPage> {
                     child: ListView.separated(
                       padding: const EdgeInsets.symmetric(vertical: 8),
                       itemCount: _conversations.length,
-                      separatorBuilder: (_, __) => const Divider(height: 1, indent: 72),
+                      separatorBuilder: (_, _) => const Divider(height: 1, indent: 72),
                       itemBuilder: (context, index) {
                         final item = _conversations[index];
                         final mode = item['room_mode'] == 'official' ? 'Official' : 'Unofficial';

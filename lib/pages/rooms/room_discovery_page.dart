@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'faculty_moderator_page.dart';
+import '../../core/utils/error_message.dart';
 
 class RoomDiscoveryPage extends StatefulWidget {
   const RoomDiscoveryPage({super.key, this.selectedRoomId});
@@ -91,7 +92,6 @@ class _RoomDiscoveryPageState extends State<RoomDiscoveryPage> {
     }
   }
 
-  @override
   Future<void> _createRoom() async {
     final name = TextEditingController();
     final accepted = await showDialog<bool>(context: context, builder: (dialogContext) => AlertDialog(
@@ -107,9 +107,11 @@ class _RoomDiscoveryPageState extends State<RoomDiscoveryPage> {
       await _supabase.rpc('create_room', params: {'p_room_id': id, 'p_name': roomName});
       await _loadRooms();
     } catch (error) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not create room: ' + error.toString())));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not create room: ${friendlyError(error)}')));
     }
   }
+
+  @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     return Scaffold(

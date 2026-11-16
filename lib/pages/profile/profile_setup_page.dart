@@ -3,6 +3,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../home/home_feed_page.dart';
 import '../../models/campus_department.dart';
+import '../../core/utils/error_message.dart';
 
 class ProfileSetupPage extends StatefulWidget {
   const ProfileSetupPage({super.key, this.isFaculty = false});
@@ -75,12 +76,7 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
       if (!mounted) return;
 
       setState(() {
-        _error = switch (e) {
-          PostgrestException(:final message, :final code) =>
-            'Profile save failed${code == null ? '' : ' ($code)'}: $message',
-          AuthException(:final message) => 'Sign-in issue: $message',
-          _ => 'Could not save profile (${e.runtimeType}). Please try again.',
-        };
+        _error = friendlyError(e);
       });
 
       debugPrint('PROFILE SETUP ERROR: $e');
@@ -151,7 +147,7 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
               if (widget.isFaculty) ...[
                 const SizedBox(height: 12),
                 DropdownButtonFormField<String?>(
-                  value: _departmentCode,
+                  initialValue: _departmentCode,
                   decoration: const InputDecoration(
                     labelText: 'Department (optional)',
                     border: OutlineInputBorder(),

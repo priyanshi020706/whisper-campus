@@ -47,7 +47,7 @@ class PostMediaFrame extends StatelessWidget {
               ),
               Material(
                 color: Colors.transparent,
-                child: InkWell(onTap: onTap),
+                child: InkWell(onTap: onTap, hoverColor: Colors.transparent),
               ),
             ],
           ),

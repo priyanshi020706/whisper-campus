@@ -1,0 +1,209 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:whisper_campus/core/theme/app_theme.dart';
+import 'package:whisper_campus/models/room_message.dart';
+import 'package:whisper_campus/pages/rooms/chat_bubble.dart';
+
+RoomMessage message({
+  String id = 'm',
+  String user = 'Anon1',
+  bool mine = false,
+  String text = 'hello',
+  String time = '2026-11-16T14:00:00+00:00',
+  String? authorId,
+}) => RoomMessage(
+  id: id,
+  roomId: 'general',
+  authorUsername: user,
+  authorId: authorId,
+  content: text,
+  createdAt: DateTime.parse(time),
+  isMine: mine,
+);
+
+void main() {
+  group('startsChatGroup', () {
+    test('first message starts a group', () {
+      expect(startsChatGroup(null, message()), isTrue);
+    });
+
+    test('same sender within minutes continues the group', () {
+      final a = message(time: '2026-11-16T14:00:00+00:00');
+      final b = message(id: 'n', time: '2026-11-16T14:02:00+00:00');
+
+      expect(startsChatGroup(a, b), isFalse);
+    });
+
+    test('a pause of five minutes starts a new group', () {
+      final a = message(time: '2026-11-16T14:00:00+00:00');
+      final b = message(id: 'n', time: '2026-11-16T14:06:00+00:00');
+
+      expect(startsChatGroup(a, b), isTrue);
+    });
+
+    test('a different sender starts a new group', () {
+      expect(startsChatGroup(message(), message(user: 'Anon2')), isTrue);
+    });
+
+    test('my message after someone else starts a group', () {
+      expect(startsChatGroup(message(), message(mine: true)), isTrue);
+    });
+  });
+
+  group('chatDayLabel', () {
+    final now = DateTime(2026, 11, 16, 20);
+
+    test('today and yesterday', () {
+      expect(chatDayLabel(DateTime(2026, 11, 16, 1), now: now), 'Today');
+      expect(chatDayLabel(DateTime(2026, 11, 15, 23), now: now), 'Yesterday');
+    });
+
+    test('older days show the date', () {
+      expect(chatDayLabel(DateTime(2026, 10, 3), now: now), '03/10/2026');
+    });
+  });
+
+  group('chatSenderColor', () {
+    test('is stable for one sender and ignores the moderator badge', () {
+      expect(
+        chatSenderColor('Anon4fece0', Brightness.light),
+        chatSenderColor('Anon4fece0 (Moderator)', Brightness.light),
+      );
+    });
+
+    test('differs between light and dark themes for readability', () {
+      expect(
+        chatSenderColor('Anon18dac4', Brightness.light),
+        isNot(chatSenderColor('Anon18dac4', Brightness.dark)),
+      );
+    });
+  });
+
+  group('ChatBubble', () {
+    Future<void> pump(
+      WidgetTester tester,
+      RoomMessage msg, {
+      required ThemeData theme,
+      bool startsGroup = true,
+      List<(String, String)> menu = const [],
+    }) async {
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: theme,
+          home: Scaffold(
+            // The real chat list scrolls; the test font is also very wide.
+            body: SingleChildScrollView(
+              child: ChatBubble(
+                message: msg,
+                startsGroup: startsGroup,
+                timeLabel: '19:47',
+                menuItems: menu,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    for (final entry in {'light': AppTheme.light, 'dark': AppTheme.dark}.entries) {
+      testWidgets('my message sits on the right (${entry.key})', (tester) async {
+        await pump(tester, message(mine: true, text: 'mine'), theme: entry.value);
+
+        expect(tester.takeException(), isNull);
+        final right = tester.getTopRight(find.text('mine')).dx;
+        expect(right, greaterThan(300));
+        expect(find.text('Anon1'), findsNothing);
+      });
+
+      testWidgets('their message sits on the left with a name (${entry.key})', (
+        tester,
+      ) async {
+        await pump(tester, message(text: 'theirs'), theme: entry.value);
+
+        expect(tester.takeException(), isNull);
+        expect(tester.getTopLeft(find.text('theirs')).dx, lessThan(100));
+        expect(find.text('Anon1'), findsOneWidget);
+      });
+    }
+
+    testWidgets('name is hidden inside a group', (tester) async {
+      await pump(tester, message(), theme: AppTheme.light, startsGroup: false);
+
+      expect(find.text('Anon1'), findsNothing);
+    });
+
+    testWidgets('long text wraps without overflow', (tester) async {
+      await pump(
+        tester,
+        message(text: 'word ' * 120, mine: true),
+        theme: AppTheme.light,
+      );
+
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('menu shows when items are given', (tester) async {
+      await pump(
+        tester,
+        message(),
+        theme: AppTheme.light,
+        menu: const [('report', 'Report message')],
+      );
+      await tester.tap(find.byTooltip('Message options'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Report message'), findsOneWidget);
+    });
+
+    testWidgets('long press opens the menu even inside a group', (tester) async {
+      String? chosen;
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.light,
+          home: Scaffold(
+            body: ChatBubble(
+              message: message(text: 'grouped'),
+              startsGroup: false,
+              timeLabel: '19:47',
+              menuItems: const [('report', 'Report message')],
+              onMenuSelected: (value) => chosen = value,
+            ),
+          ),
+        ),
+      );
+
+      await tester.longPress(find.text('grouped'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Report message'));
+      await tester.pumpAndSettle();
+
+      expect(chosen, 'report');
+    });
+
+    testWidgets('my bubble and their bubble use different colours', (
+      tester,
+    ) async {
+      Color bubbleColor() {
+        final box = tester.widgetList<DecoratedBox>(
+          find.descendant(
+            of: find.byType(ChatBubble),
+            matching: find.byType(DecoratedBox),
+          ),
+        ).first;
+        return (box.decoration as BoxDecoration).color!;
+      }
+
+      await pump(tester, message(mine: true), theme: AppTheme.light);
+      final mineColor = bubbleColor();
+      await pump(tester, message(), theme: AppTheme.light);
+
+      expect(bubbleColor(), isNot(mineColor));
+    });
+  });
+}
