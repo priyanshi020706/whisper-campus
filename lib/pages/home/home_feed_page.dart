@@ -149,10 +149,13 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       final role = row?['role']?.toString();
       final isFaculty = role == 'faculty';
       final isSuperAdmin = role == 'super_admin';
-      var hasModeratorInbox = false;
+      var hasModeratorInbox = isSuperAdmin;
       try {
         final rooms = await _supabase.rpc('list_my_moderated_rooms');
-        hasModeratorInbox = rooms is List && rooms.isNotEmpty;
+        // Super Admin has room-wide moderation access even without a
+        // room_moderators assignment row (those rows are for students).
+        hasModeratorInbox = hasModeratorInbox ||
+            (rooms is List && rooms.isNotEmpty);
       } catch (_) {}
       if (mounted) {
         setState(() {

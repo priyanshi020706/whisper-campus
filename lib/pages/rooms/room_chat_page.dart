@@ -49,7 +49,7 @@ class _RoomChatPageState extends State<RoomChatPage> {
     super.initState();
     if (widget.roomConversation) {
       _joinRoomConversation();
-    } else if (widget.roomId == 'official-live') {
+    } else if (widget.roomId == 'official-live' || widget.roomId == 'general') {
       _joinOfficialSession();
     } else {
       _startChat();
@@ -83,6 +83,18 @@ class _RoomChatPageState extends State<RoomChatPage> {
 
   Future<void> _joinRoomConversation() async {
     try {
+      final blocked = await _supabase.rpc(
+        'get_my_room_block',
+        params: {'p_room_id': widget.roomId, 'p_mode': widget.roomMode},
+      );
+      if (blocked is List && blocked.isNotEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _blockedReason = blocked.first['reason'] as String? ?? 'Room rules violation';
+          _loading = false;
+        });
+        return;
+      }
       await _supabase.rpc(
         'join_room_chat',
         params: {'p_room_id': widget.roomId, 'p_mode': widget.roomMode},
@@ -101,9 +113,10 @@ class _RoomChatPageState extends State<RoomChatPage> {
 
   Future<void> _joinOfficialSession() async {
     try {
+      final mode = widget.roomId == 'official-live' ? 'official' : 'unofficial';
       final blocked = await _supabase.rpc(
         'get_my_room_block',
-        params: {'p_room_id': widget.roomId},
+        params: {'p_room_id': widget.roomId, 'p_mode': mode},
       );
       if (blocked is List && blocked.isNotEmpty) {
         if (!mounted) return;
@@ -119,10 +132,12 @@ class _RoomChatPageState extends State<RoomChatPage> {
       final faculty = await _supabase.rpc('is_faculty');
       final moderator = await _supabase.rpc(
         'is_active_room_moderator',
-        params: {'p_room': widget.roomId},
+        params: {'p_room': widget.roomId, 'p_mode': mode},
       );
       if (mounted)
-        setState(() => _canModerateRoom = faculty == true || moderator == true);
+        setState(() => _canModerateRoom =
+            _isSuperAdmin || moderator == true ||
+            (widget.roomId == 'official-live' && faculty == true));
       if (mounted) _startChat();
     } catch (error) {
       if (!mounted) return;
@@ -380,6 +395,11 @@ class _RoomChatPageState extends State<RoomChatPage> {
           'p_room_id': widget.roomId,
           'p_user_id': authorId,
           'p_reason': messageReason,
+          'p_mode': widget.roomConversation
+              ? widget.roomMode
+              : widget.roomId == 'official-live'
+              ? 'official'
+              : 'unofficial',
         },
       );
       if (mounted)
