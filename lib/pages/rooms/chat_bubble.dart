@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../../models/chat_extras.dart';
 import '../../models/room_message.dart';
+import 'chat_parts.dart';
 
 /// Name colours for other people's messages. They come from the app's own
 /// palette (lavender, berry, teal, amber, and a soft indigo), so the chat looks
@@ -119,6 +121,16 @@ class ChatDaySeparator extends StatelessWidget {
   }
 }
 
+/// The message a bubble replies to, as shown inside the bubble.
+class ChatQuote {
+  const ChatQuote({required this.author, required this.content, this.onTap});
+
+  /// Null when the original is no longer loaded.
+  final String? author;
+  final String content;
+  final VoidCallback? onTap;
+}
+
 /// One message bubble. My messages sit on the right in the theme's strong
 /// colour; everyone else's sit on the left on a neutral surface with the
 /// sender's name in their own colour.
@@ -136,6 +148,12 @@ class ChatBubble extends StatelessWidget {
     this.onMenuSelected,
     this.onNameTap,
     this.onNameLongPress,
+    this.quote,
+    this.reactions = const [],
+    this.onReactionTap,
+    this.pollBuilder,
+    this.onActions,
+    this.onSwipeReply,
   });
 
   final RoomMessage message;
@@ -149,6 +167,22 @@ class ChatBubble extends StatelessWidget {
   final ValueChanged<String>? onMenuSelected;
   final VoidCallback? onNameTap;
   final VoidCallback? onNameLongPress;
+
+  /// The message this one replies to.
+  final ChatQuote? quote;
+  final List<ReactionCount> reactions;
+  final void Function(String emoji)? onReactionTap;
+
+  /// Builds a poll to show instead of the message text. Receives the text and
+  /// accent colours that suit this bubble.
+  final Widget Function(Color textColor, Color accent)? pollBuilder;
+
+  /// Long-press (touch) or right-click (desktop): opens the message actions.
+  /// When null the plain "..." menu opens instead.
+  final VoidCallback? onActions;
+
+  /// Swipe right on the bubble to reply.
+  final VoidCallback? onSwipeReply;
 
   List<PopupMenuEntry<String>> _menuEntries() => [
     for (final item in menuItems)
@@ -253,19 +287,39 @@ class ChatBubble extends StatelessWidget {
       ),
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 7, 12, 5),
-        child: IntrinsicWidth(
-          child: Column(
+        child: _fit(
+          pollBuilder != null,
+          maxWidth,
+          Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
               if (!mine && startsGroup) nameRow,
-              Text(
-                message.content,
-                style: theme.textTheme.bodyLarge?.copyWith(
-                  color: textColor,
-                  height: 1.3,
+              if (quote != null)
+                QuoteBlock(
+                  author: quote!.author,
+                  content: quote!.content,
+                  accent: mine ? colors.onPrimary : colors.primary,
+                  textColor: textColor,
+                  onTap: quote!.onTap,
                 ),
-              ),
+              if (pollBuilder != null)
+                pollBuilder!(textColor, mine ? colors.onPrimary : colors.primary)
+              else
+                Text(
+                  message.content,
+                  style: theme.textTheme.bodyLarge?.copyWith(
+                    color: textColor,
+                    height: 1.3,
+                  ),
+                ),
+              if (reactions.isNotEmpty && onReactionTap != null)
+                ReactionChips(
+                  reactions: reactions,
+                  onTap: onReactionTap!,
+                  textColor: textColor,
+                  accent: mine ? colors.onPrimary : colors.primary,
+                ),
               const SizedBox(height: 2),
               Align(
                 alignment: Alignment.centerRight,
@@ -291,12 +345,21 @@ class ChatBubble extends StatelessWidget {
         child: ConstrainedBox(
           constraints: BoxConstraints(maxWidth: maxWidth),
           child: GestureDetector(
-            onLongPressStart: hasMenu
+            onLongPressStart: onActions != null
+                ? (_) => onActions!()
+                : hasMenu
                 ? (details) => _openMenu(context, details.globalPosition)
                 : null,
-            onSecondaryTapDown: hasMenu
+            onSecondaryTapDown: onActions != null
+                ? (_) => onActions!()
+                : hasMenu
                 ? (details) => _openMenu(context, details.globalPosition)
                 : null,
+            onHorizontalDragEnd: onSwipeReply == null
+                ? null
+                : (details) {
+                    if ((details.primaryVelocity ?? 0) > 300) onSwipeReply!();
+                  },
             child: bubble,
           ),
         ),
@@ -304,3 +367,8 @@ class ChatBubble extends StatelessWidget {
     );
   }
 }
+
+/// Polls need the full bubble width; ordinary messages shrink to their text.
+Widget _fit(bool fullWidth, double maxWidth, Widget child) => fullWidth
+    ? SizedBox(width: maxWidth - 24, child: child)
+    : IntrinsicWidth(child: child);

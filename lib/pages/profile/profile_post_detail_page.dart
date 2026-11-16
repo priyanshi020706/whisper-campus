@@ -6,7 +6,10 @@ import '../../core/widgets/student_avatar.dart';
 import '../../models/profile_activity.dart';
 import '../../models/post_content.dart';
 import '../../core/utils/error_message.dart';
+import '../../core/widgets/keyboard_helpers.dart';
 import '../../services/live_signals.dart';
+import '../../services/post_edit_flow.dart';
+import '../../core/widgets/edit_dialogs.dart';
 
 class ProfilePostDetailPage extends StatefulWidget {
   const ProfilePostDetailPage({
@@ -72,6 +75,16 @@ class _ProfilePostDetailPageState extends State<ProfilePostDetailPage> {
     super.dispose();
   }
 
+  Future<void> _editReply(Map<String, dynamic> reply) async {
+    final changed = await runEditCommentFlow(
+      context,
+      kind: widget.officialMode ? 'official_reply' : 'reply',
+      replyId: reply['reply_id'] as String,
+      content: reply['content'] as String? ?? '',
+    );
+    if (changed && mounted) await _loadReplies(showLoading: false);
+  }
+
   Future<void> _loadReplies({bool showLoading = true}) async {
     if (showLoading) {
       setState(() {
@@ -81,10 +94,11 @@ class _ProfilePostDetailPageState extends State<ProfilePostDetailPage> {
     }
     try {
       final rows = await _supabase.rpc(
-        widget.officialMode
-            ? 'get_official_post_replies'
-            : 'get_post_replies_with_avatars',
-        params: {'p_post_id': widget.activity.postId},
+        'get_post_replies_v2',
+        params: {
+          'p_kind': widget.officialMode ? 'official_post' : 'post',
+          'p_post_id': widget.activity.postId,
+        },
       );
       if (!mounted) return;
       setState(() {
@@ -209,6 +223,8 @@ class _ProfilePostDetailPageState extends State<ProfilePostDetailPage> {
             child: RefreshIndicator(
               onRefresh: _loadReplies,
               child: ListView(
+                keyboardDismissBehavior:
+                    ScrollViewKeyboardDismissBehavior.onDrag,
                 padding: const EdgeInsets.fromLTRB(16, 16, 16, 20),
                 children: [
                   if (activity.isComment) ...[
@@ -275,17 +291,21 @@ class _ProfilePostDetailPageState extends State<ProfilePostDetailPage> {
                     ..._replies.map(
                       (reply) => _ReplyTile(
                         author:
-                            (reply[widget.officialMode
-                                    ? 'author_name'
-                                    : 'author_username']
-                                as String?) ??
-                            'Student',
+                            (reply['author_label'] as String?) ?? 'Student',
                         content: reply['content'] as String? ?? '',
                         time: _timeLabel(
                           DateTime.parse(reply['created_at'] as String),
                         ),
                         officialMode: widget.officialMode,
                         avatarSeed: reply['avatar_seed'] as String?,
+                        edited: reply['edited_at'] != null,
+                        onEdit:
+                            reply['is_mine'] == true &&
+                                canStillEdit(
+                                  DateTime.parse(reply['created_at'] as String),
+                                )
+                            ? () => _editReply(reply)
+                            : null,
                       ),
                     ),
                 ],
@@ -299,21 +319,24 @@ class _ProfilePostDetailPageState extends State<ProfilePostDetailPage> {
               child: Row(
                 children: [
                   Expanded(
-                    child: TextField(
+                    child: SendOnEnter(
                       controller: _replyController,
-                      minLines: 1,
-                      maxLines: 4,
-                      maxLength: 2000,
-                      decoration: InputDecoration(
-                        hintText: 'Write a comment…',
-                        counterText: '',
-                        filled: true,
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(24),
-                          borderSide: BorderSide.none,
+                      onSend: _sendReply,
+                      child: TextField(
+                        controller: _replyController,
+                        minLines: 1,
+                        maxLines: 4,
+                        maxLength: 2000,
+                        decoration: InputDecoration(
+                          hintText: 'Write a comment…',
+                          counterText: '',
+                          filled: true,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(24),
+                            borderSide: BorderSide.none,
+                          ),
                         ),
                       ),
-                      onSubmitted: (_) => _sendReply(),
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -521,6 +544,8 @@ class _ReplyTile extends StatelessWidget {
     required this.time,
     required this.officialMode,
     this.avatarSeed,
+    this.edited = false,
+    this.onEdit,
   });
 
   final String author;
@@ -528,6 +553,10 @@ class _ReplyTile extends StatelessWidget {
   final String time;
   final bool officialMode;
   final String? avatarSeed;
+  final bool edited;
+
+  /// Null when the signed-in user cannot edit this comment.
+  final VoidCallback? onEdit;
 
   @override
   Widget build(BuildContext context) {
@@ -562,7 +591,7 @@ class _ReplyTile extends StatelessWidget {
                         ),
                       ),
                       Text(
-                        time,
+                        edited ? '$time · edited' : time,
                         style: Theme.of(context).textTheme.labelSmall
                             ?.copyWith(color: colors.onSurfaceVariant),
                       ),
@@ -570,6 +599,20 @@ class _ReplyTile extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                   Text(content, style: Theme.of(context).textTheme.bodyMedium),
+                  if (onEdit != null)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: onEdit,
+                        icon: const Icon(Icons.edit_outlined, size: 16),
+                        label: const Text('Edit'),
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                      ),
+                    ),
                 ],
               ),
             ),

@@ -41,10 +41,17 @@ The platform is built around four principles:
 - [x] Super Admin tools
 - [x] Content reporting, strikes and an admin audit log
 - [x] Server-side rate limits on posts, replies and chat
+- [x] Live updates for chat, posts, likes, comments and notifications
+- [x] Recent chats and up to 3 pinned rooms
+- [x] Notification settings, muted rooms and Web Push notifications
+- [x] Saved posts, post search, and editing posts and comments
+- [x] Chat replies, emoji reactions and polls (in chats and posts)
+- [x] Events with Going / Interested, and announcements
 
 ### Upcoming
 
 - [ ] Automated moderation (AI)
+- [ ] Image and file sharing in chat
 - [ ] Emergency identity access with audit logging
 - [ ] Account deletion and data export
 - [ ] Mobile release setup (bundle ID, deep links)

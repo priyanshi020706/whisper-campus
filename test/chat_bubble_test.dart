@@ -2,7 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:whisper_campus/core/theme/app_theme.dart';
 import 'package:whisper_campus/models/room_message.dart';
+import 'package:whisper_campus/models/chat_extras.dart';
+import 'package:whisper_campus/models/poll.dart';
+import 'package:whisper_campus/core/widgets/poll_card.dart';
 import 'package:whisper_campus/pages/rooms/chat_bubble.dart';
+import 'test_helpers.dart';
 
 RoomMessage message({
   String id = 'm',
@@ -205,5 +209,182 @@ void main() {
 
       expect(bubbleColor(), isNot(mineColor));
     });
+  });
+
+  group('ChatBubble replies, reactions and polls', () {
+    final pollData = PollData(
+      pollId: 'p',
+      targetId: 'm',
+      question: 'Pizza or burger?',
+      allowsMultiple: false,
+      totalVoters: 3,
+      options: const [
+        PollOption(id: 'a', label: 'Pizza', votes: 2, mine: false),
+        PollOption(id: 'b', label: 'Burger', votes: 1, mine: true),
+      ],
+    );
+
+    Widget bubble({
+      bool mine = false,
+      ChatQuote? quote,
+      List<ReactionCount> reactions = const [],
+      bool withPoll = false,
+      void Function(String)? onReactionTap,
+      VoidCallback? onActions,
+      VoidCallback? onSwipeReply,
+      String text = 'hello',
+    }) => ChatBubble(
+      message: message(mine: mine, text: text),
+      startsGroup: true,
+      timeLabel: '19:47',
+      quote: quote,
+      reactions: reactions,
+      onReactionTap: onReactionTap ?? (_) {},
+      onActions: onActions,
+      onSwipeReply: onSwipeReply,
+      pollBuilder: withPoll
+          ? (textColor, accent) => PollCard(
+              poll: pollData,
+              textColor: textColor,
+              accentColor: accent,
+              onVote: (_) async => null,
+            )
+          : null,
+    );
+
+    testWidgets('shows the quoted message, reactions and counts', (tester) async {
+      useScreen(tester, const Screen('d', Size(360, 740), 1.0));
+      await tester.pumpWidget(
+        themedApp(
+          Scaffold(
+            body: bubble(
+              quote: const ChatQuote(author: 'Anon2', content: 'the original text'),
+              reactions: const [
+                ReactionCount(emoji: '👍', count: 3, mine: true),
+                ReactionCount(emoji: '😂', count: 1, mine: false),
+              ],
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('Anon2'), findsWidgets);
+      expect(find.text('the original text'), findsOneWidget);
+      expect(find.text('👍'), findsOneWidget);
+      expect(find.text('3'), findsOneWidget);
+    });
+
+    testWidgets('a poll replaces the message text', (tester) async {
+      useScreen(tester, const Screen('d', Size(360, 740), 1.0));
+      await tester.pumpWidget(
+        themedApp(Scaffold(body: SingleChildScrollView(child: bubble(withPoll: true, text: '📊 Pizza or burger?')))),
+      );
+
+      expect(find.text('Pizza or burger?'), findsOneWidget); // the poll question
+      expect(find.text('📊 Pizza or burger?'), findsNothing); // not the raw text
+      expect(find.text('Pizza'), findsOneWidget);
+      expect(find.text('67%'), findsOneWidget);
+    });
+
+    testWidgets('tapping a reaction reports the emoji', (tester) async {
+      String? tapped;
+      useScreen(tester, const Screen('d', Size(360, 740), 1.0));
+      await tester.pumpWidget(
+        themedApp(
+          Scaffold(
+            body: bubble(
+              reactions: const [ReactionCount(emoji: '❤️', count: 1, mine: false)],
+              onReactionTap: (e) => tapped = e,
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('❤️'));
+
+      expect(tapped, '❤️');
+    });
+
+    testWidgets('long press opens the actions, swipe right replies', (tester) async {
+      var actions = 0;
+      var replies = 0;
+      useScreen(tester, const Screen('d', Size(360, 740), 1.0));
+      await tester.pumpWidget(
+        themedApp(
+          Scaffold(
+            body: bubble(onActions: () => actions++, onSwipeReply: () => replies++),
+          ),
+        ),
+      );
+
+      await tester.longPress(find.text('hello'));
+      await tester.fling(find.text('hello'), const Offset(200, 0), 1000);
+      await tester.pump(const Duration(milliseconds: 500));
+
+      expect(actions, 1);
+      expect(replies, 1);
+    });
+
+    testWidgets('a swipe left does not reply', (tester) async {
+      var replies = 0;
+      useScreen(tester, const Screen('d', Size(360, 740), 1.0));
+      await tester.pumpWidget(
+        themedApp(Scaffold(body: bubble(onSwipeReply: () => replies++))),
+      );
+
+      await tester.fling(find.text('hello'), const Offset(-200, 0), 1000);
+      await tester.pump(const Duration(milliseconds: 500));
+
+      expect(replies, 0);
+    });
+
+    for (final screen in smallScreens) {
+      for (final mine in [false, true]) {
+        testWidgets('everything at once fits: ${screen.name}, mine=$mine', (tester) async {
+          useScreen(tester, screen);
+          await tester.pumpWidget(
+            themedApp(
+              Scaffold(
+                body: SingleChildScrollView(
+                  child: bubble(
+                    mine: mine,
+                    quote: ChatQuote(author: 'Someone with a long name ' * 3, content: 'quoted ' * 60),
+                    reactions: [
+                      for (final e in reactionEmojis)
+                        ReactionCount(emoji: e, count: 99, mine: e == '😮'),
+                    ],
+                    text: 'a long message ' * 40,
+                  ),
+                ),
+              ),
+              textScale: screen.textScale,
+            ),
+          );
+
+          expectNoLayoutErrors(tester);
+        });
+
+        testWidgets('a poll bubble fits: ${screen.name}, mine=$mine', (tester) async {
+          useScreen(tester, screen);
+          await tester.pumpWidget(
+            themedApp(
+              Scaffold(
+                body: SingleChildScrollView(
+                  child: bubble(
+                    mine: mine,
+                    withPoll: true,
+                    quote: const ChatQuote(author: 'A', content: 'quoted'),
+                    reactions: const [ReactionCount(emoji: '👍', count: 12, mine: true)],
+                  ),
+                ),
+              ),
+              textScale: screen.textScale,
+            ),
+          );
+
+          expectNoLayoutErrors(tester);
+        });
+      }
+    }
   });
 }

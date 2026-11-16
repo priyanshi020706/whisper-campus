@@ -5,6 +5,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/utils/error_message.dart';
 import '../../services/college_profile_sync.dart';
+import '../../services/push/push_controller.dart';
 import '../home/home_feed_page.dart';
 import '../profile/profile_setup_page.dart';
 import 'sign_up_page.dart';
@@ -143,6 +144,7 @@ class _AuthGateState extends State<AuthGate> {
   }
 
   Future<void> _signOut() async {
+    await PushController.removeThisDevice();
     try {
       await _supabase.auth.signOut();
     } catch (error) {

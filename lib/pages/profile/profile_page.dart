@@ -9,6 +9,7 @@ import '../../models/campus_department.dart';
 import 'profile_post_detail_page.dart';
 import '../../core/utils/error_message.dart';
 import '../../services/live_signals.dart';
+import '../../services/push/push_controller.dart';
 import '../../core/widgets/post_preview.dart';
 
 const _avatarChoices = [
@@ -429,6 +430,8 @@ class _ProfilePageState extends State<ProfilePage> {
 
   Future<void> _signOut() async {
     try {
+      // Stop this device receiving the account's push notifications first.
+      await PushController.removeThisDevice();
       await _supabase.auth.signOut();
       if (!mounted) return;
       Navigator.of(context).popUntil((route) => route.isFirst);

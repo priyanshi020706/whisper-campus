@@ -1,6 +1,6 @@
 {
   "installCommand": "git clone --depth 1 --single-branch --branch 3.47.4 https://github.com/flutter/flutter.git .flutter-sdk && ./.flutter-sdk/bin/flutter config --enable-web && ./.flutter-sdk/bin/flutter pub get",
-  "buildCommand": "./.flutter-sdk/bin/flutter build web --release",
+  "buildCommand": "./.flutter-sdk/bin/flutter build web --release --dart-define=VAPID_PUBLIC_KEY=$VAPID_PUBLIC_KEY",
   "outputDirectory": "build/web",
   "rewrites": [
     {

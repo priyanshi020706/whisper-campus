@@ -26,3 +26,19 @@ jobs:
 
       - name: Test
         run: flutter test
+
+  push-function-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Edge Function's logic is plain TypeScript; Node 24 runs it directly.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Test the send-push helpers
+        run: node --test supabase/functions/send-push/payload.test.mts
+
+      - name: Test the push service worker
+        run: node --test web_tests/push_sw.test.mjs

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../core/utils/error_message.dart';
+import '../../core/widgets/keyboard_helpers.dart';
 
 class RoomModeratorContactPage extends StatefulWidget {
   const RoomModeratorContactPage({super.key, required this.roomId, required this.roomName, required this.mode, this.initialThreadId});
@@ -20,6 +21,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
   final _db = Supabase.instance.client;
   final _controller = TextEditingController();
   final _scroll = ScrollController();
+  late final KeyboardStickyScroll _keyboardScroll;
   Timer? _refreshTimer;
   List<Map<String, dynamic>> _threads = [];
   List<Map<String, dynamic>> _messages = [];
@@ -32,6 +34,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
   @override
   void initState() {
     super.initState();
+    _keyboardScroll = KeyboardStickyScroll(_scroll)..attach();
     _start();
   }
 
@@ -93,10 +96,12 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
     try {
       final rows = await _db.rpc('get_room_moderator_messages', params: {'p_thread_id': id});
       if (!mounted) return;
+      // Only follow new messages if the reader was already at the bottom, so
+      // the 'refresh' timer does not pull them away from older messages.
+      final atBottom = !_scroll.hasClients ||
+          _scroll.position.maxScrollExtent - _scroll.position.pixels < 120;
       setState(() => _messages = List<Map<String, dynamic>>.from(rows));
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
-      });
+      if (atBottom) _keyboardScroll.jumpToBottomAfterLayout();
     } catch (error) {
       if (mounted) setState(() => _error = friendlyError(error));
     }
@@ -121,6 +126,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
   @override
   void dispose() {
     _refreshTimer?.cancel();
+    _keyboardScroll.dispose();
     _controller.dispose();
     _scroll.dispose();
     super.dispose();
@@ -158,6 +164,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
                     Expanded(
                       child: ListView.builder(
                         controller: _scroll,
+                        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
                         padding: const EdgeInsets.all(16),
                         itemCount: _messages.length,
                         itemBuilder: (context, index) {
@@ -187,7 +194,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
                       child: Padding(
                         padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
                         child: Row(children: [
-                          Expanded(child: TextField(controller: _controller, minLines: 1, maxLines: 4, decoration: const InputDecoration(hintText: 'Write a suggestion…', border: OutlineInputBorder()))),
+                          Expanded(child: SendOnEnter(controller: _controller, onSend: _send, child: TextField(controller: _controller, minLines: 1, maxLines: 4, textCapitalization: TextCapitalization.sentences, decoration: const InputDecoration(hintText: 'Write a suggestion…', border: OutlineInputBorder())))),
                           const SizedBox(width: 8),
                           IconButton.filled(onPressed: _sending ? null : _send, icon: const Icon(Icons.send_rounded)),
                         ]),
