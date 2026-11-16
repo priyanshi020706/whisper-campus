@@ -38,12 +38,6 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
       setState(() => _error = 'Please sign in again.');
       return;
     }
-    if (_firstNameController.text.trim().isEmpty ||
-        _lastNameController.text.trim().isEmpty) {
-      setState(() => _error = 'Enter both your first name and last name.');
-      return;
-    }
-
     setState(() {
       _loading = true;
       _error = null;
@@ -128,8 +122,8 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
               const SizedBox(height: 8),
               Text(
                 widget.isFaculty
-                    ? 'Enter the name people will see in Official rooms. Your department is optional.'
-                    : 'Choose the name your classmates will see in Official mode. Student branch and year are verified from your MITS email when available. Your anonymous profile stays separate.',
+                    ? 'Add the name people will see in Official rooms. Name and department are optional; you can continue without them.'
+                    : 'Add the name classmates will see in Official mode. Name is optional. Branch and year are verified from your MITS email when available; your anonymous profile stays separate.',
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 24),
@@ -139,7 +133,7 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
                 textInputAction: TextInputAction.next,
                 maxLength: 60,
                 decoration: const InputDecoration(
-                  labelText: 'First name *',
+                  labelText: 'First name (optional)',
                   border: OutlineInputBorder(),
                 ),
               ),
@@ -150,7 +144,7 @@ class _ProfileSetupPageState extends State<ProfileSetupPage> {
                 textInputAction: TextInputAction.next,
                 maxLength: 60,
                 decoration: const InputDecoration(
-                  labelText: 'Last name *',
+                  labelText: 'Last name (optional)',
                   border: OutlineInputBorder(),
                 ),
               ),
