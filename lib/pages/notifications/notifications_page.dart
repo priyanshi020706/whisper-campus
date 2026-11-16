@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../../core/utils/error_message.dart';
+import '../../models/post_content.dart';
+import '../../services/live_signals.dart';
 
 class NotificationsPage extends StatefulWidget {
   const NotificationsPage({super.key});
@@ -13,18 +16,37 @@ class _NotificationsPageState extends State<NotificationsPage> {
   List<Map<String, dynamic>> _items = [];
   bool _loading = true;
   String? _error;
+  LiveSubscription? _liveSubscription;
+  final _liveRefresh = Debouncer();
 
   @override
   void initState() {
     super.initState();
     _load();
+    final userId = _supabase.auth.currentUser?.id;
+    if (userId != null) {
+      _liveSubscription = LiveSignals.instance.listen('user:$userId', (_) {
+        _liveRefresh.run(() {
+          if (mounted) _load(showLoading: false);
+        });
+      });
+    }
   }
 
-  Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+  @override
+  void dispose() {
+    _liveSubscription?.cancel();
+    _liveRefresh.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
     try {
       final rows = await _supabase.rpc(
         'get_my_notifications',
@@ -38,7 +60,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _error = 'Could not load notifications: $error';
+        _error = 'Could not load notifications: ${friendlyError(error)}';
         _loading = false;
       });
     }
@@ -59,7 +81,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Could not mark notification as read: $error'),
+            content: Text('Could not mark notification as read: ${friendlyError(error)}'),
           ),
         );
       }
@@ -80,7 +102,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Could not mark notifications as read: $error'),
+            content: Text('Could not mark notifications as read: ${friendlyError(error)}'),
           ),
         );
       }
@@ -145,7 +167,9 @@ class _NotificationsPageState extends State<NotificationsPage> {
                   final liked = item['activity_type'] == 'like';
                   final unread = item['read_at'] == null;
                   final actor = item['actor_name']?.toString() ?? 'Someone';
-                  final preview = item['preview']?.toString() ?? '';
+                  final preview = PostContent.previewText(
+                    item['preview']?.toString() ?? '',
+                  );
                   return ListTile(
                     onTap: () => _markRead(item),
                     tileColor: unread

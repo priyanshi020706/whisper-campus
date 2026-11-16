@@ -3,10 +3,21 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-import 'sign_up_page.dart';
-import '../profile/profile_setup_page.dart';
-import '../home/home_feed_page.dart';
+import '../../core/utils/error_message.dart';
 import '../../services/college_profile_sync.dart';
+import '../home/home_feed_page.dart';
+import '../profile/profile_setup_page.dart';
+import 'sign_up_page.dart';
+
+/// What the signed-in user still has to do before reaching the home feed.
+class _AccountState {
+  const _AccountState({required this.isFaculty, required this.ready});
+
+  final bool isFaculty;
+
+  /// True when the profile is complete and an identity record exists.
+  final bool ready;
+}
 
 class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
@@ -22,6 +33,11 @@ class _AuthGateState extends State<AuthGate> {
   StreamSubscription<AuthState>? _authSubscription;
   final Set<String> _syncingProfileIds = {};
   final Set<String> _syncedProfileIds = {};
+
+  // The account lookup is cached so ordinary rebuilds do not query Supabase
+  // again. It is reset on sign-in changes and after profile setup.
+  Future<_AccountState>? _accountFuture;
+  String? _accountFutureUserId;
 
   final _supabase = Supabase.instance.client;
 
@@ -40,23 +56,26 @@ class _AuthGateState extends State<AuthGate> {
       (data) {
         if (!mounted) return;
 
+        final session = data.session;
         setState(() {
-          _session = data.session;
-          _profileSyncComplete = data.session == null ||
-              _syncedProfileIds.contains(data.session?.user.id ?? '');
+          // A different user (or sign-out) must never reuse the old lookup.
+          if (session?.user.id != _accountFutureUserId) {
+            _accountFuture = null;
+            _accountFutureUserId = null;
+          }
+          _session = session;
+          _profileSyncComplete =
+              session == null || _syncedProfileIds.contains(session.user.id);
           _error = null;
         });
-        final session = data.session;
         if (session != null) {
           unawaited(_syncCollegeDetails(session));
         }
       },
-      onError: (error, stackTrace) {
+      onError: (Object error, StackTrace stackTrace) {
+        debugPrint('AUTH STATE ERROR: $error');
         if (!mounted) return;
-
-        setState(() {
-          _error = error.toString();
-        });
+        setState(() => _error = friendlyError(error));
       },
     );
   }
@@ -68,19 +87,74 @@ class _AuthGateState extends State<AuthGate> {
     }
 
     try {
-      await syncCollegeProfileDetails(
-        supabase: _supabase,
-      );
+      await syncCollegeProfileDetails(supabase: _supabase);
       _syncedProfileIds.add(userId);
     } catch (error) {
+      debugPrint('COLLEGE PROFILE SYNC ERROR: $error');
       if (mounted) {
-        setState(() => _error =
-            'Could not verify your MITS Google account. Please sign in again.\n\nDetails: $error');
+        setState(() {
+          _error = 'Could not verify your MITS Google account. '
+              'Sign in with your college Google account and try again.';
+        });
       }
     } finally {
       _syncingProfileIds.remove(userId);
       if (mounted) setState(() => _profileSyncComplete = true);
     }
+  }
+
+  Future<_AccountState> _loadAccount(String userId) async {
+    final profile = await _supabase
+        .from('profiles')
+        .select('profile_completed, role')
+        .eq('id', userId)
+        .maybeSingle();
+    final isFaculty = profile?['role'] == 'faculty';
+
+    if (profile == null || profile['profile_completed'] != true) {
+      return _AccountState(isFaculty: isFaculty, ready: false);
+    }
+
+    final identity = await _supabase.rpc('get_my_identity');
+    final hasIdentity = identity is List && identity.isNotEmpty;
+    return _AccountState(isFaculty: isFaculty, ready: hasIdentity);
+  }
+
+  Future<_AccountState> _accountFor(String userId) {
+    if (_accountFuture == null || _accountFutureUserId != userId) {
+      _accountFutureUserId = userId;
+      _accountFuture = _loadAccount(userId);
+    }
+    return _accountFuture!;
+  }
+
+  void _retry() {
+    final session = _session;
+    setState(() {
+      _error = null;
+      _accountFuture = null;
+      _accountFutureUserId = null;
+      if (session != null) {
+        _syncedProfileIds.remove(session.user.id);
+        _profileSyncComplete = false;
+      }
+    });
+    if (session != null) unawaited(_syncCollegeDetails(session));
+  }
+
+  Future<void> _signOut() async {
+    try {
+      await _supabase.auth.signOut();
+    } catch (error) {
+      debugPrint('SIGN OUT ERROR: $error');
+    }
+    if (!mounted) return;
+    setState(() {
+      _error = null;
+      _session = null;
+      _accountFuture = null;
+      _accountFutureUserId = null;
+    });
   }
 
   @override
@@ -89,23 +163,48 @@ class _AuthGateState extends State<AuthGate> {
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    if (_error != null) {
-      return Scaffold(
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Text(
-              'Authentication error:\n\n$_error',
-              textAlign: TextAlign.center,
+  Widget _messageScreen(String message, {bool canRetry = true}) {
+    return Scaffold(
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(message, textAlign: TextAlign.center),
+                const SizedBox(height: 20),
+                Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
+                  alignment: WrapAlignment.center,
+                  children: [
+                    if (canRetry)
+                      FilledButton(onPressed: _retry, child: const Text('Retry')),
+                    OutlinedButton(
+                      onPressed: _signOut,
+                      child: const Text('Sign out'),
+                    ),
+                  ],
+                ),
+              ],
             ),
           ),
         ),
-      );
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final error = _error;
+    if (error != null) {
+      return _messageScreen(error);
     }
 
-    if (_session == null) {
+    final session = _session;
+    if (session == null) {
       return const SignUpPage();
     }
 
@@ -113,12 +212,8 @@ class _AuthGateState extends State<AuthGate> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    return FutureBuilder(
-      future: _supabase
-          .from('profiles')
-          .select('profile_completed, role')
-          .eq('id', _session!.user.id)
-          .maybeSingle(),
+    return FutureBuilder<_AccountState>(
+      future: _accountFor(session.user.id),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Scaffold(
@@ -127,56 +222,17 @@ class _AuthGateState extends State<AuthGate> {
         }
 
         if (snapshot.hasError) {
-          return Scaffold(
-            body: Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Text(
-                  'Could not load your profile.\n\n'
-                  '${snapshot.error}',
-                  textAlign: TextAlign.center,
-                ),
-              ),
-            ),
+          debugPrint('ACCOUNT LOAD ERROR: ${snapshot.error}');
+          return _messageScreen(
+            'Could not load your profile. ${friendlyError(snapshot.error)}',
           );
         }
 
-        final profile = snapshot.data;
-        final isFaculty = profile?['role'] == 'faculty';
-
-        if (profile == null || profile['profile_completed'] != true) {
-          return ProfileSetupPage(isFaculty: isFaculty);
+        final account = snapshot.requireData;
+        if (!account.ready) {
+          return ProfileSetupPage(isFaculty: account.isFaculty);
         }
-
-        return FutureBuilder(
-          future: _supabase.rpc('get_my_identity'),
-          builder: (context, identitySnapshot) {
-            if (identitySnapshot.connectionState == ConnectionState.waiting) {
-              return const Scaffold(
-                body: Center(child: CircularProgressIndicator()),
-              );
-            }
-            if (identitySnapshot.hasError) {
-              return Scaffold(
-                body: Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(24),
-                    child: Text(
-                      'Could not verify your official profile. Please retry.\n\n'
-                      '${identitySnapshot.error}',
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
-                ),
-              );
-            }
-            final rows = identitySnapshot.data;
-            if (rows is! List || rows.isEmpty) {
-              return ProfileSetupPage(isFaculty: isFaculty);
-            }
-            return const HomeFeedPage();
-          },
-        );
+        return const HomeFeedPage();
       },
     );
   }

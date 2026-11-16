@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../../core/utils/error_message.dart';
 
 class RoomModeratorContactPage extends StatefulWidget {
   const RoomModeratorContactPage({super.key, required this.roomId, required this.roomName, required this.mode, this.initialThreadId});
@@ -64,7 +65,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
       });
       if (mounted) setState(() => _loading = false);
     } catch (error) {
-      if (mounted) setState(() { _error = error.toString(); _loading = false; });
+      if (mounted) setState(() { _error = friendlyError(error); _loading = false; });
     }
   }
 
@@ -76,7 +77,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
       });
       if (mounted) setState(() => _threads = List<Map<String, dynamic>>.from(rows));
     } catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted) setState(() => _error = friendlyError(error));
     }
   }
 
@@ -97,7 +98,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
         if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
       });
     } catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted) setState(() => _error = friendlyError(error));
     }
   }
 
@@ -111,7 +112,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
       _controller.clear();
       await _loadMessages();
     } catch (error) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Message could not be sent: $error')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Message could not be sent: ${friendlyError(error)}')));
     } finally {
       if (mounted) setState(() => _sending = false);
     }
@@ -142,7 +143,7 @@ class _RoomModeratorContactPageState extends State<RoomModeratorContactPage> {
                     ? const Center(child: Text('No suggestions yet.'))
                     : ListView.separated(
                         itemCount: _threads.length,
-                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        separatorBuilder: (_, _) => const Divider(height: 1),
                         itemBuilder: (context, index) {
                           final item = _threads[index];
                           return ListTile(

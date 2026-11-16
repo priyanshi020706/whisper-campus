@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-import '../../models/post_content.dart';
+import '../../core/utils/error_message.dart';
+import 'post_review_card.dart';
+import '../../services/live_signals.dart';
 
 class HomePostReviewPage extends StatefulWidget {
   const HomePostReviewPage({super.key, required this.mode});
@@ -16,6 +18,8 @@ class _HomePostReviewPageState extends State<HomePostReviewPage> {
   final _db = Supabase.instance.client;
   final Map<String, String> _imageUrls = {};
   final Set<String> _working = {};
+  LiveSubscription? _liveSubscription;
+  final _liveRefresh = Debouncer();
   List<Map<String, dynamic>> _posts = [];
   bool _loading = true;
   String? _error;
@@ -26,13 +30,31 @@ class _HomePostReviewPageState extends State<HomePostReviewPage> {
   void initState() {
     super.initState();
     _load();
+    _liveSubscription = LiveSignals.instance.listen('feed:${widget.mode}', (
+      signal,
+    ) {
+      final kind = signal['kind'];
+      if (kind != 'post' && kind != 'resync') return;
+      _liveRefresh.run(() {
+        if (mounted) _load(showLoading: false);
+      });
+    });
   }
 
-  Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+  @override
+  void dispose() {
+    _liveSubscription?.cancel();
+    _liveRefresh.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
     try {
       final result = await _db.rpc(
         'get_pending_room_reviews',
@@ -58,7 +80,7 @@ class _HomePostReviewPageState extends State<HomePostReviewPage> {
       if (!mounted) return;
       setState(() {
         _loading = false;
-        _error = error.toString();
+        _error = friendlyError(error);
       });
     }
   }
@@ -79,7 +101,9 @@ class _HomePostReviewPageState extends State<HomePostReviewPage> {
       if (!mounted) return;
       setState(() => _working.remove(postId));
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not review post: $error')),
+        SnackBar(
+          content: Text('Could not review post: ${friendlyError(error)}'),
+        ),
       );
     }
   }
@@ -90,7 +114,9 @@ class _HomePostReviewPageState extends State<HomePostReviewPage> {
     return Scaffold(
       appBar: AppBar(
         title: Text('$campusName post approvals'),
-        actions: [IconButton(onPressed: _load, icon: const Icon(Icons.refresh))],
+        actions: [
+          IconButton(onPressed: _load, icon: const Icon(Icons.refresh)),
+        ],
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
@@ -102,7 +128,10 @@ class _HomePostReviewPageState extends State<HomePostReviewPage> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Text('Could not load approvals: $_error'),
-                    TextButton(onPressed: _load, child: const Text('Try again')),
+                    TextButton(
+                      onPressed: _load,
+                      child: const Text('Try again'),
+                    ),
                   ],
                 ),
               ),
@@ -112,73 +141,19 @@ class _HomePostReviewPageState extends State<HomePostReviewPage> {
           : ListView.separated(
               padding: const EdgeInsets.all(16),
               itemCount: _posts.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 12),
+              separatorBuilder: (_, _) => const SizedBox(height: 12),
               itemBuilder: (context, index) {
                 final row = _posts[index];
                 final id = row['post_id'].toString();
-                final formatted = PostContent.decode(
-                  row['content']?.toString() ?? '',
-                );
-                final image = _imageUrls[id];
-                return Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '${row['room_name']} · ${row['author_label']}',
-                          style: Theme.of(context).textTheme.titleSmall,
-                        ),
-                        if (formatted.title.isNotEmpty) ...[
-                          const SizedBox(height: 10),
-                          Text(
-                            formatted.title,
-                            style: Theme.of(context).textTheme.titleMedium
-                                ?.copyWith(fontWeight: FontWeight.w700),
-                          ),
-                        ],
-                        if (formatted.body.isNotEmpty) ...[
-                          const SizedBox(height: 6),
-                          Text(formatted.body),
-                        ],
-                        if (image != null) ...[
-                          const SizedBox(height: 12),
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(12),
-                            child: Image.network(image, fit: BoxFit.cover),
-                          ),
-                        ],
-                        const SizedBox(height: 12),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.end,
-                          children: [
-                            TextButton(
-                              onPressed: _working.contains(id)
-                                  ? null
-                                  : () => _review(id, 'rejected'),
-                              child: const Text('Reject'),
-                            ),
-                            const SizedBox(width: 8),
-                            FilledButton(
-                              onPressed: _working.contains(id)
-                                  ? null
-                                  : () => _review(id, 'approved'),
-                              child: _working.contains(id)
-                                  ? const SizedBox(
-                                      width: 18,
-                                      height: 18,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    )
-                                  : const Text('Approve'),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
+                return PostReviewCard(
+                  heading: '${row['room_name'] ?? 'Room'}',
+                  subheading: row['author_label']?.toString(),
+                  submittedAt: DateTime.tryParse('${row['created_at'] ?? ''}'),
+                  content: row['content']?.toString() ?? '',
+                  imageUrl: _imageUrls[id],
+                  busy: _working.contains(id),
+                  onReject: () => _review(id, 'rejected'),
+                  onApprove: () => _review(id, 'approved'),
                 );
               },
             ),

@@ -5,6 +5,8 @@ import '../../core/widgets/campus_live_action.dart';
 import '../../core/widgets/student_avatar.dart';
 import '../../models/profile_activity.dart';
 import '../../models/post_content.dart';
+import '../../core/utils/error_message.dart';
+import '../../services/live_signals.dart';
 
 class ProfilePostDetailPage extends StatefulWidget {
   const ProfilePostDetailPage({
@@ -37,6 +39,8 @@ class _ProfilePostDetailPageState extends State<ProfilePostDetailPage> {
   bool _sending = false;
   bool _liking = false;
   String? _error;
+  LiveSubscription? _liveSubscription;
+  final _liveRefresh = Debouncer();
 
   @override
   void initState() {
@@ -45,19 +49,36 @@ class _ProfilePostDetailPageState extends State<ProfilePostDetailPage> {
     _commentCount = widget.activity.commentCount;
     _likedByMe = widget.activity.likedByMe;
     _loadReplies();
+    _liveSubscription = LiveSignals.instance.listen(
+      widget.officialMode ? 'feed:official' : 'feed:unofficial',
+      (signal) {
+        final kind = signal['kind'];
+        final forThisPost =
+            signal['post_id']?.toString() == widget.activity.postId;
+        if (kind == 'resync' || (kind == 'reply' && forThisPost)) {
+          _liveRefresh.run(() {
+            if (mounted) _loadReplies(showLoading: false);
+          });
+        }
+      },
+    );
   }
 
   @override
   void dispose() {
+    _liveSubscription?.cancel();
+    _liveRefresh.dispose();
     _replyController.dispose();
     super.dispose();
   }
 
-  Future<void> _loadReplies() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+  Future<void> _loadReplies({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
     try {
       final rows = await _supabase.rpc(
         widget.officialMode
@@ -143,7 +164,7 @@ class _ProfilePostDetailPageState extends State<ProfilePostDetailPage> {
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not send your comment: $error')),
+          SnackBar(content: Text('Could not send your comment: ${friendlyError(error)}')),
         );
       }
       debugPrint('PROFILE POST REPLY ERROR: $error');

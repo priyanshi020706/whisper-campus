@@ -7,6 +7,9 @@ import '../../models/profile_model.dart';
 import '../../models/post_content.dart';
 import '../../models/campus_department.dart';
 import 'profile_post_detail_page.dart';
+import '../../core/utils/error_message.dart';
+import '../../services/live_signals.dart';
+import '../../core/widgets/post_preview.dart';
 
 const _avatarChoices = [
   _AvatarChoice(seed: '8E6CFF', emoji: '🤖', label: 'Bot'),
@@ -51,14 +54,49 @@ class _ProfilePageState extends State<ProfilePage> {
   List<Map<String, dynamic>> _pendingPosts = [];
   _ProfileSection _section = _ProfileSection.posts;
 
+  final List<LiveSubscription> _liveSubscriptions = [];
+  final _liveRefresh = Debouncer(const Duration(milliseconds: 800));
+
+  @override
+  void dispose() {
+    for (final subscription in _liveSubscriptions) {
+      subscription.cancel();
+    }
+    _liveRefresh.dispose();
+    super.dispose();
+  }
+
   @override
   void initState() {
     super.initState();
     _fetchProfile();
+    _startLiveUpdates();
   }
 
-  Future<void> _fetchProfile() async {
-    if (mounted) {
+  /// Likes and comments on my posts arrive as notifications for me; approvals
+  /// and removals of my posts arrive as post changes in the feed.
+  void _startLiveUpdates() {
+    final userId = _supabase.auth.currentUser?.id;
+    void refresh() {
+      _liveRefresh.run(() {
+        if (mounted) _fetchProfile(quiet: true);
+      });
+    }
+
+    _liveSubscriptions.addAll([
+      if (userId != null) LiveSignals.instance.listen('user:$userId', (_) => refresh()),
+      LiveSignals.instance.listen(
+        widget.officialMode ? 'feed:official' : 'feed:unofficial',
+        (signal) {
+          final kind = signal['kind'];
+          if (kind == 'post' || kind == 'resync') refresh();
+        },
+      ),
+    ]);
+  }
+
+  Future<void> _fetchProfile({bool quiet = false}) async {
+    if (mounted && !quiet) {
       setState(() {
         _loading = true;
         _error = null;
@@ -124,13 +162,15 @@ class _ProfilePageState extends State<ProfilePage> {
         _loading = false;
       });
     } on PostgrestException catch (error) {
-      if (!mounted) return;
+      debugPrint('PROFILE ERROR: $error');
+      // A failed background refresh keeps what is already on screen.
+      if (!mounted || quiet) return;
       setState(() {
-        _error = 'Could not load your profile: ${error.message}';
+        _error = 'Could not load your profile: ${friendlyError(error)}';
         _loading = false;
       });
     } catch (error) {
-      if (!mounted) return;
+      if (!mounted || quiet) return;
       setState(() {
         _error = 'Could not load your profile. Please try again.';
         _loading = false;
@@ -311,7 +351,7 @@ class _ProfilePageState extends State<ProfilePage> {
                 ),
                 const SizedBox(height: 12),
                 DropdownButtonFormField<String?>(
-                  value: departmentCode,
+                  initialValue: departmentCode,
                   decoration: const InputDecoration(
                     labelText: 'Department (optional)',
                   ),
@@ -380,7 +420,7 @@ class _ProfilePageState extends State<ProfilePage> {
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not save faculty profile: $error')),
+        SnackBar(content: Text('Could not save faculty profile: ${friendlyError(error)}')),
       );
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -797,14 +837,7 @@ class _ProfilePageState extends State<ProfilePage> {
         Text('Post review status', style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800)),
         const SizedBox(height: 8),
         for (final post in _pendingPosts)
-          Card(
-            child: ListTile(
-              leading: Icon(post['approval_status'] == 'pending' ? Icons.hourglass_top_rounded : Icons.cancel_outlined,
-                  color: post['approval_status'] == 'pending' ? colors.tertiary : colors.error),
-              title: Text(post['approval_status'] == 'pending' ? 'Waiting for room moderator' : 'Not approved'),
-              subtitle: Text('${post['room_id']} · ${(post['content']?.toString() ?? '').replaceAll(RegExp(r'\s+'), ' ').trim()}', maxLines: 2, overflow: TextOverflow.ellipsis),
-            ),
-          ),
+          _PendingPostCard(post: post),
       ],
     );
   }
@@ -1220,4 +1253,63 @@ class _AvatarChoice {
   final String label;
 
   Color get color => Color(int.parse('0xFF$seed'));
+}
+
+/// A post of mine that is waiting for, or was refused by, a room moderator.
+class _PendingPostCard extends StatelessWidget {
+  const _PendingPostCard({required this.post});
+
+  final Map<String, dynamic> post;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final pending = post['approval_status'] == 'pending';
+    final accent = pending ? colors.tertiary : colors.error;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 9),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  pending
+                      ? Icons.hourglass_top_rounded
+                      : Icons.cancel_outlined,
+                  size: 18,
+                  color: accent,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    pending ? 'Waiting for room moderator' : 'Not approved',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      color: accent,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 2),
+            Text(
+              roomDisplayName(post['room_id']?.toString()),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: colors.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 10),
+            PostPreview(
+              content: post['content']?.toString() ?? '',
+              maxBodyLines: 4,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }

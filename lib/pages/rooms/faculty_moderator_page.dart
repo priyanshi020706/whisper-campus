@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../../core/utils/error_message.dart';
 
 class FacultyModeratorPage extends StatefulWidget {
   const FacultyModeratorPage({super.key, this.initialMode = 'official'});
@@ -97,11 +98,12 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
       });
       await _loadModerators();
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         setState(() {
           _loading = false;
-          _error = 'Could not load rooms: ' + e.toString();
+          _error = 'Could not load rooms: ${friendlyError(e)}';
         });
+      }
     }
   }
 
@@ -112,11 +114,13 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
         'list_room_moderators',
         params: {'p_room_id': _roomId, 'p_mode': _mode},
       );
-      if (mounted)
+      if (mounted) {
         setState(() => _moderators = List<Map<String, dynamic>>.from(rows));
+      }
     } catch (e) {
-      if (mounted)
-        setState(() => _error = 'Could not load moderators: ' + e.toString());
+      if (mounted) {
+        setState(() => _error = 'Could not load moderators: ${friendlyError(e)}');
+      }
     }
   }
 
@@ -163,7 +167,7 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
       if (mounted && currentRequest == _searchRequestId) {
         setState(() {
           _busy = false;
-          _error = 'Search failed: ' + e.toString();
+          _error = 'Search failed: ${friendlyError(e)}';
         });
       }
     }
@@ -198,18 +202,11 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  student['student_name'].toString() +
-                      ' · ' +
-                      student['branch_code'].toString() +
-                      ' · ' +
-                      _year(student['study_year']),
+                  '${student['student_name']} · ${student['branch_code']} · ${_year(student['study_year'])}',
                 ),
                 Text(
-                  'Enrollment: ' +
-                      (student['enrollment_number']?.toString() ??
-                          'Unavailable') +
-                      ' · Roll: ' +
-                      (student['roll_number']?.toString() ?? 'Unavailable'),
+                  'Enrollment: ${student['enrollment_number']?.toString() ??
+                          'Unavailable'} · Roll: ${student['roll_number']?.toString() ?? 'Unavailable'}',
                 ),
                 const SizedBox(height: 12),
                 OutlinedButton(
@@ -220,7 +217,7 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
                       lastDate: DateTime.now().add(const Duration(days: 3650)),
                       initialDate: DateTime.now().add(const Duration(days: 30)),
                     );
-                    if (date != null)
+                    if (date != null) {
                       setSheet(
                         () => expires = DateTime(
                           date.year,
@@ -228,17 +225,17 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
                           date.day,
                         ).add(const Duration(days: 1)),
                       );
+                    }
                   },
                   child: Text(
                     expires == null
                         ? 'No expiry (default)'
-                        : 'Expires ' +
-                              expires!
+                        : 'Expires ${expires!
                                   .subtract(const Duration(days: 1))
                                   .toLocal()
                                   .toString()
                                   .split(' ')
-                                  .first,
+                                  .first}',
                   ),
                 ),
                 if (expires != null)
@@ -269,10 +266,11 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
       );
       await _loadModerators();
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Assignment failed: ' + e.toString())),
+          SnackBar(content: Text('Assignment failed: ${friendlyError(e)}')),
         );
+      }
     }
   }
 
@@ -288,17 +286,19 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
       );
       await _loadModerators();
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Removal failed: ' + e.toString())),
+          SnackBar(content: Text('Removal failed: ${friendlyError(e)}')),
         );
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_loading)
+    if (_loading) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
     return Scaffold(
       appBar: AppBar(title: const Text('Room moderators')),
       body: ListView(
@@ -306,7 +306,7 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
         children: [
           if (_isSuperAdmin) ...[
             DropdownButtonFormField<String>(
-              value: _mode,
+              initialValue: _mode,
               decoration: const InputDecoration(
                 labelText: 'Campus side',
                 border: OutlineInputBorder(),
@@ -338,7 +338,7 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
             const SizedBox(height: 14),
           ],
           DropdownButtonFormField<String>(
-            value: _roomId,
+            initialValue: _roomId,
             decoration: const InputDecoration(
               labelText: 'Room',
               border: OutlineInputBorder(),
@@ -361,7 +361,7 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
           ),
           const SizedBox(height: 18),
           DropdownButtonFormField<String?>(
-            value: _branch,
+            initialValue: _branch,
             decoration: const InputDecoration(
               labelText: 'Branch (optional)',
               border: OutlineInputBorder(),
@@ -418,17 +418,10 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
           for (final s in _students)
             ListTile(
               title: Text(
-                s['student_name'].toString() +
-                    ' · ' +
-                    s['branch_code'].toString() +
-                    ' · ' +
-                    _year(s['study_year']),
+                '${s['student_name']} · ${s['branch_code']} · ${_year(s['study_year'])}',
               ),
               subtitle: Text(
-                'Enrollment: ' +
-                    (s['enrollment_number']?.toString() ?? 'Unavailable') +
-                    ' · Roll: ' +
-                    (s['roll_number']?.toString() ?? 'Unavailable'),
+                'Enrollment: ${s['enrollment_number']?.toString() ?? 'Unavailable'} · Roll: ${s['roll_number']?.toString() ?? 'Unavailable'}',
               ),
               trailing: const Icon(Icons.add_moderator_outlined),
               onTap: () => _assign(s),
@@ -446,17 +439,10 @@ class _FacultyModeratorPageState extends State<FacultyModeratorPage> {
           for (final m in _moderators)
             ListTile(
               title: Text(
-                m['student_name'].toString() +
-                    ' · ' +
-                    m['branch_code'].toString() +
-                    ' · ' +
-                    _year(m['study_year']),
+                '${m['student_name']} · ${m['branch_code']} · ${_year(m['study_year'])}',
               ),
               subtitle: Text(
-                'Enrollment: ' +
-                    (m['enrollment_number']?.toString() ?? 'Unavailable') +
-                    ' · Roll: ' +
-                    (m['roll_number']?.toString() ?? 'Unavailable'),
+                'Enrollment: ${m['enrollment_number']?.toString() ?? 'Unavailable'} · Roll: ${m['roll_number']?.toString() ?? 'Unavailable'}',
               ),
               trailing: TextButton(
                 onPressed: () => _remove(m),

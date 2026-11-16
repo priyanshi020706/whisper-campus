@@ -31,18 +31,24 @@ The platform is built around four principles:
 - [x] Modular project structure
 - [x] GitHub repository setup
 
+### Phase 2 — Campus features ✅
+
+- [x] Official and unofficial campus modes
+- [x] Anonymous posts with images, likes and replies
+- [x] Campus rooms with live chat
+- [x] Room moderators, post approvals and a moderator inbox
+- [x] Notifications
+- [x] Super Admin tools
+- [x] Content reporting, strikes and an admin audit log
+- [x] Server-side rate limits on posts, replies and chat
+
 ### Upcoming
 
-- [ ] Campus rooms
-- [ ] Real-time messaging
-- [ ] Anonymous posts
-- [ ] Reactions and voting
-- [ ] Reporting system
-- [ ] AI moderation
-- [ ] Strike system
-- [ ] Notifications
-- [ ] Administrative moderation
+- [ ] Automated moderation (AI)
 - [ ] Emergency identity access with audit logging
+- [ ] Account deletion and data export
+- [ ] Mobile release setup (bundle ID, deep links)
+- [ ] Splitting the largest screens into smaller files
 
 ---
 
@@ -107,6 +113,8 @@ Current security measures include:
 - Protected identity records
 - Separation of identity and anonymous profile data
 - Backend-controlled authorization
+- Google-only sign-in, verified on the server (provider, confirmed email, MITS domain)
+- Server-side rate limits and content reporting
 - No exposure of real identity fields to normal users
 
 Future safety mechanisms include reporting, moderation, strikes, audit logging, and controlled emergency identity access.
@@ -204,3 +212,16 @@ The team is building the system incrementally, starting with authentication and 
 **Current Stage:** Foundation / Authentication & Profile
 
 The project is under active development.
+
+## Development
+
+```bash
+flutter pub get
+flutter analyze
+flutter test
+```
+
+CI runs the same analyze and test steps on every pull request.
+
+Database changes live in `supabase/migrations`. See `supabase/README.md` for
+how to apply them safely.
