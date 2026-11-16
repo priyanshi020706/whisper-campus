@@ -111,6 +111,10 @@ Current security measures include:
 
 Future safety mechanisms include reporting, moderation, strikes, audit logging, and controlled emergency identity access.
 
+## Developers
+- Priyanshi
+- Ritesh
+
 ## Tech Stack
 Frontend
 - Flutter
