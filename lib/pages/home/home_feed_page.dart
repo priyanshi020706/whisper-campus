@@ -17,6 +17,7 @@ import '../rooms/department_rooms_page.dart';
 import '../rooms/faculty_moderator_page.dart';
 import '../rooms/room_chat_page.dart';
 import '../rooms/room_post_review_page.dart';
+import '../rooms/home_post_review_page.dart';
 import '../rooms/room_moderator_contact_page.dart';
 import '../rooms/moderator_inbox_page.dart';
 import '../notifications/notifications_page.dart';
@@ -57,6 +58,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
   bool _isSuperAdmin = false;
   bool _hasModeratorInbox = false;
   bool _canReviewRoomPosts = false;
+  int _pendingApprovalCount = 0;
   bool _identityLoaded = false;
   String? _identityError;
   List<_CampusPost> _posts = [];
@@ -92,7 +94,10 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     unawaited(_loadUnreadNotifications());
     _notificationTimer = Timer.periodic(
       const Duration(seconds: 30),
-      (_) => _loadUnreadNotifications(),
+      (_) {
+        _loadUnreadNotifications();
+        _loadPendingApprovalCount();
+      },
     );
     unawaited(_loadMyAvatarSeed(initializeHome: true));
   }
@@ -184,6 +189,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         } else {
           await _loadRooms();
         }
+        if (!widget.roomPage) await _loadPendingApprovalCount();
       }
     } catch (_) {
       if (initializeHome && mounted) {
@@ -309,6 +315,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         await _loadPosts();
       }
     }
+    await _loadPendingApprovalCount();
   }
 
   Future<void> _loadOfficialPosts({bool showLoading = true}) async {
@@ -825,7 +832,8 @@ class _HomeFeedPageState extends State<HomeFeedPage>
         await _loadPosts(showLoading: false);
       }
       if (mounted) {
-        var directPost = _isFaculty || _isSuperAdmin;
+        var directPost = _isFaculty || _isSuperAdmin ||
+            (modeAtOpen == _CampusMode.unofficial && roomId == 'general');
         if (!directPost) {
           try {
             directPost =
@@ -1199,6 +1207,35 @@ class _HomeFeedPageState extends State<HomeFeedPage>
     );
   }
 
+  Future<void> _loadPendingApprovalCount() async {
+    if (widget.roomPage || !_hasModeratorInbox) return;
+    try {
+      final value = await _supabase.rpc(
+        'get_pending_room_review_count',
+        params: {'p_mode': _mode.name},
+      );
+      if (mounted) {
+        setState(() => _pendingApprovalCount = (value as num?)?.toInt() ?? 0);
+      }
+    } catch (_) {
+      // Keep the home feed usable if the review-inbox migration is not deployed.
+    }
+  }
+
+  Future<void> _openHomePostReview() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => HomePostReviewPage(mode: _mode.name),
+      ),
+    );
+    await _loadPendingApprovalCount();
+    if (_mode == _CampusMode.official) {
+      await _loadOfficialPosts(showLoading: false);
+    } else {
+      await _loadPosts(showLoading: false);
+    }
+  }
+
   Future<void> _loadUnreadNotifications() async {
     try {
       final value = await _supabase.rpc('get_my_unread_notification_count');
@@ -1290,6 +1327,20 @@ class _HomeFeedPageState extends State<HomeFeedPage>
       ),
       style: compactButtonStyle,
     );
+    final pendingApprovals = !widget.roomPage && _hasModeratorInbox
+        ? IconButton(
+            tooltip: 'Pending post approvals',
+            onPressed: _openHomePostReview,
+            icon: Badge(
+              isLabelVisible: _pendingApprovalCount > 0,
+              label: Text(
+                _pendingApprovalCount > 99 ? '99+' : '$_pendingApprovalCount',
+              ),
+              child: const Icon(Icons.fact_check_outlined),
+            ),
+            style: compactButtonStyle,
+          )
+        : null;
     final theme = IconButton(
       tooltip: Theme.of(context).brightness == Brightness.dark
           ? 'Switch to light theme'
@@ -1305,7 +1356,13 @@ class _HomeFeedPageState extends State<HomeFeedPage>
 
     if (compact) {
       if (!widget.roomPage) {
-        return [notifications, live, if (moderators != null) moderators, theme];
+        return [
+          notifications,
+          if (pendingApprovals != null) pendingApprovals,
+          live,
+          if (moderators != null) moderators,
+          theme,
+        ];
       }
       return [
         notifications,
@@ -1348,7 +1405,7 @@ class _HomeFeedPageState extends State<HomeFeedPage>
               ),
             if (widget.roomPage)
               const PopupMenuItem(value: 'rooms', child: Text('Explore rooms')),
-            if (widget.roomPage && _canReviewRoomPosts)
+            if (widget.roomPage && _canReviewRoomPosts && !_isSuperAdmin)
               const PopupMenuItem(
                 value: 'review',
                 child: Text('Review pending posts'),
@@ -1385,13 +1442,14 @@ class _HomeFeedPageState extends State<HomeFeedPage>
           onPressed: _openModeratorInbox,
           icon: const Icon(Icons.inbox_outlined),
         ),
+      if (pendingApprovals != null) pendingApprovals,
       if (widget.roomPage)
         IconButton(
           tooltip: 'Explore rooms',
           onPressed: () => _scaffoldKey.currentState?.openDrawer(),
           icon: const Icon(Icons.menu_rounded),
         ),
-      if (widget.roomPage && _canReviewRoomPosts)
+      if (widget.roomPage && _canReviewRoomPosts && !_isSuperAdmin)
         IconButton(
           tooltip: 'Review pending posts',
           onPressed: _openRoomPostReview,
