@@ -14,6 +14,7 @@ order), after everything older:
 | `20261118020000_search_events_and_announcements` | search, events, announcements |
 | `20261118030000_push_notifications` | push queue and delivery (needs the setup below) |
 | `20261118040000_mute_durations_and_short_edit_window` | mute for 1 hour / 8 hours / until unmuted; edits allowed for 10 minutes |
+| `20261118050000_profile_name_from_google` | name and enrollment filled from the Google account on first sign-in; fixes "Campus profile sync required" when saving the profile |
 
 Apply files in `migrations/` in filename order. Try each new migration on a
 Supabase branch (or a copy of the project) before production.
