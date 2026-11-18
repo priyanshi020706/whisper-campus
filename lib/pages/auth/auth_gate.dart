@@ -5,20 +5,10 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/utils/error_message.dart';
 import '../../services/college_profile_sync.dart';
+import '../../services/profile_setup_service.dart';
 import '../../services/push/push_controller.dart';
 import '../home/home_feed_page.dart';
-import '../profile/profile_setup_page.dart';
 import 'sign_up_page.dart';
-
-/// What the signed-in user still has to do before reaching the home feed.
-class _AccountState {
-  const _AccountState({required this.isFaculty, required this.ready});
-
-  final bool isFaculty;
-
-  /// True when the profile is complete and an identity record exists.
-  final bool ready;
-}
 
 class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
@@ -34,11 +24,6 @@ class _AuthGateState extends State<AuthGate> {
   StreamSubscription<AuthState>? _authSubscription;
   final Set<String> _syncingProfileIds = {};
   final Set<String> _syncedProfileIds = {};
-
-  // The account lookup is cached so ordinary rebuilds do not query Supabase
-  // again. It is reset on sign-in changes and after profile setup.
-  Future<_AccountState>? _accountFuture;
-  String? _accountFutureUserId;
 
   final _supabase = Supabase.instance.client;
 
@@ -59,11 +44,6 @@ class _AuthGateState extends State<AuthGate> {
 
         final session = data.session;
         setState(() {
-          // A different user (or sign-out) must never reuse the old lookup.
-          if (session?.user.id != _accountFutureUserId) {
-            _accountFuture = null;
-            _accountFutureUserId = null;
-          }
           _session = session;
           _profileSyncComplete =
               session == null || _syncedProfileIds.contains(session.user.id);
@@ -89,6 +69,28 @@ class _AuthGateState extends State<AuthGate> {
 
     try {
       await syncCollegeProfileDetails(supabase: _supabase);
+
+      // Profile identity is created from the verified Google identity during
+      // sign-in. Do not make students or faculty complete a blocking form.
+      try {
+        final profile = await _supabase
+            .from('profiles')
+            .select('role')
+            .eq('id', userId)
+            .maybeSingle();
+        final isFaculty = profile?['role'] == 'faculty';
+        await saveProfile(
+          _supabase,
+          isFaculty: isFaculty,
+          firstName: '',
+          lastName: '',
+        );
+      } catch (error) {
+        // Missing optional profile details should not block access. The user
+        // can complete optional profile fields later from the profile screen.
+        debugPrint('OPTIONAL PROFILE COMPLETION ERROR: $error');
+      }
+
       _syncedProfileIds.add(userId);
     } catch (error) {
       debugPrint('COLLEGE PROFILE SYNC ERROR: $error');
@@ -104,37 +106,10 @@ class _AuthGateState extends State<AuthGate> {
     }
   }
 
-  Future<_AccountState> _loadAccount(String userId) async {
-    final profile = await _supabase
-        .from('profiles')
-        .select('profile_completed, role')
-        .eq('id', userId)
-        .maybeSingle();
-    final isFaculty = profile?['role'] == 'faculty';
-
-    if (profile == null || profile['profile_completed'] != true) {
-      return _AccountState(isFaculty: isFaculty, ready: false);
-    }
-
-    final identity = await _supabase.rpc('get_my_identity');
-    final hasIdentity = identity is List && identity.isNotEmpty;
-    return _AccountState(isFaculty: isFaculty, ready: hasIdentity);
-  }
-
-  Future<_AccountState> _accountFor(String userId) {
-    if (_accountFuture == null || _accountFutureUserId != userId) {
-      _accountFutureUserId = userId;
-      _accountFuture = _loadAccount(userId);
-    }
-    return _accountFuture!;
-  }
-
   void _retry() {
     final session = _session;
     setState(() {
       _error = null;
-      _accountFuture = null;
-      _accountFutureUserId = null;
       if (session != null) {
         _syncedProfileIds.remove(session.user.id);
         _profileSyncComplete = false;
@@ -154,8 +129,6 @@ class _AuthGateState extends State<AuthGate> {
     setState(() {
       _error = null;
       _session = null;
-      _accountFuture = null;
-      _accountFutureUserId = null;
     });
   }
 
@@ -214,28 +187,6 @@ class _AuthGateState extends State<AuthGate> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    return FutureBuilder<_AccountState>(
-      future: _accountFor(session.user.id),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(
-            body: Center(child: CircularProgressIndicator()),
-          );
-        }
-
-        if (snapshot.hasError) {
-          debugPrint('ACCOUNT LOAD ERROR: ${snapshot.error}');
-          return _messageScreen(
-            'Could not load your profile. ${friendlyError(snapshot.error)}',
-          );
-        }
-
-        final account = snapshot.requireData;
-        if (!account.ready) {
-          return ProfileSetupPage(isFaculty: account.isFaculty);
-        }
-        return const HomeFeedPage();
-      },
-    );
+    return const HomeFeedPage();
   }
 }
